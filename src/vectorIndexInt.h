@@ -10,6 +10,7 @@ extern "C" {
 
 typedef struct DiskAnnIndex DiskAnnIndex;
 typedef struct BlobSpot BlobSpot;
+typedef struct DiskAnnLog DiskAnnLog;
 
 /*
  * Main type which holds all necessary index information and will be passed as a first argument in all index-related operations
@@ -33,6 +34,10 @@ struct DiskAnnIndex {
 
   int nReads;
   int nWrites;
+
+  /* Pending edge operations for this index, shared by every cursor that has
+  ** it open; NULL when physiological logging is off.  See vectordiskann.c. */
+  DiskAnnLog *pLog;
 };
 
 /*
@@ -232,6 +237,8 @@ int diskAnnOpenIndex(sqlite3 *, const char *, const char *, const VectorIdxParam
 void diskAnnCloseIndex(DiskAnnIndex *);
 int diskAnnInsert(DiskAnnIndex *, const VectorInRow *, char **);
 int diskAnnDelete(DiskAnnIndex *, const VectorInRow *, char **);
+/* write back every node that has pending edge operations and release them */
+int diskAnnMergeAll(DiskAnnIndex *);
 int diskAnnSearch(DiskAnnIndex *, const Vector *, int, const VectorIdxKey *, VectorOutRows *, char **);
 
 typedef struct VectorIdxCursor VectorIdxCursor;

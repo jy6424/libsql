@@ -1254,6 +1254,9 @@ static void libsqlVectorIdx(sqlite3_context *context, int argc, sqlite3_value **
 /*
 ** Register vector functions.
 */
+/* implemented in vectorIndex.c, where VectorIdxCursor is visible */
+void libsqlVectorMergeFunc(sqlite3_context*, int, sqlite3_value**);
+
 void sqlite3RegisterVectorFunctions(void){
  static FuncDef aVectorFuncs[] = {
     FUNCTION(vector,              1, 0, 0, vector32Func),
@@ -1268,6 +1271,7 @@ void sqlite3RegisterVectorFunctions(void){
     FUNCTION(vector_distance_l2,  2, 0, 0, vectorDistanceL2Func),
 
     FUNCTION(libsql_vector_idx,  -1, 0, 0, libsqlVectorIdx),
+    FUNCTION(libsql_vector_merge, 1, 0, 0, libsqlVectorMergeFunc),
   };
   sqlite3InsertBuiltinFuncs(aVectorFuncs, ArraySize(aVectorFuncs));
 }

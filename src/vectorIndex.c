@@ -1175,6 +1175,38 @@ int vectorIndexCursorInit(
   return SQLITE_OK;
 }
 
+/*
+** libsql_vector_merge(IDX) - write every node that still has pending edge
+** operations back to its block and release them.  This is the vector index's
+** counterpart to PRAGMA wal_checkpoint: nothing is incorrect without it, but
+** the operations stay in memory and every read of those nodes pays to replay
+** them.  Returns the number of blocks written.
+*/
+void libsqlVectorMergeFunc(sqlite3_context *context, int argc, sqlite3_value **argv){
+  sqlite3 *db = sqlite3_context_db_handle(context);
+  VectorIdxCursor *pCursor = NULL;
+  const char *zIdxName;
+  int rc, nReads = 0, nWrites = 0;
+
+  assert( argc == 1 );
+  if( sqlite3_value_type(argv[0]) != SQLITE_TEXT ){
+    sqlite3_result_error(context, "libsql_vector_merge: index name expected", -1);
+    return;
+  }
+  zIdxName = (const char*)sqlite3_value_text(argv[0]);
+  if( vectorIndexCursorInit(db, "main", zIdxName, &pCursor) != SQLITE_OK ){
+    sqlite3_result_error(context, "libsql_vector_merge: no such vector index", -1);
+    return;
+  }
+  rc = diskAnnMergeAll(pCursor->pIndex);
+  vectorIndexCursorClose(db, pCursor, &nReads, &nWrites);
+  if( rc != SQLITE_OK ){
+    sqlite3_result_error_code(context, rc);
+  }else{
+    sqlite3_result_int(context, nWrites);
+  }
+}
+
 void vectorIndexCursorClose(sqlite3 *db, VectorIdxCursor *pCursor, int *nReads, int *nWrites){
   *nReads = pCursor->pIndex->nReads;
   *nWrites = pCursor->pIndex->nWrites;

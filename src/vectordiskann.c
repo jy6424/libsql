@@ -196,6 +196,495 @@ static void diskAnnStatInit(const DiskAnnIndex *pIndex){
 #define DISKANN_STAT_NEWNODE(P)
 #endif /* LIBSQL_DISKANN_STAT */
 
+/*
+** Physiological logging of edge updates - stage 1, memory only.
+**
+** A back-edge update normally rewrites a node's whole block.  Here the change
+** is recorded as a small operation instead ("put peer p in edge slot i", "drop
+** edge slot j") and kept in a per-node chain in memory, leaving the block on
+** disk stale.  blobSpotReload() replays a node's pending operations into the
+** buffer right after reading it, so every reader still sees current data.  A
+** merge eventually writes the block once, absorbing everything that piled up
+** for that node - one block write instead of k.
+**
+** Operations are produced inside nodeBinReplaceEdge()/nodeBinDeleteEdge(), the
+** only two functions that touch a node's edges, and are replayed by calling
+** those same functions with recording off.  A replayed block is therefore
+** identical to one built by the direct path, which is what makes the two modes
+** comparable byte for byte.
+**
+** Nothing is written to disk here, so operations that have not been merged are
+** lost if the process dies.  The log file that fixes that is the next step.
+**
+** Off unless LIBSQL_PLOG is set.  Environment:
+**   LIBSQL_PLOG         enable
+**   LIBSQL_PLOG_BUDGET  bytes of pending operations to hold (default 512M)
+**   LIBSQL_PLOG_M       nodes merged per insert once over budget (default 2)
+*/
+#include <stdlib.h>
+#include <string.h>
+
+/* defined with the rest of the serialisation helpers further down */
+static inline u16 readLE16(const unsigned char*);
+static inline u32 readLE32(const unsigned char*);
+static inline u64 readLE64(const unsigned char*);
+static inline void writeLE16(unsigned char*, u16);
+static inline void writeLE32(unsigned char*, u32);
+static inline void writeLE64(unsigned char*, u64);
+
+#define DISKANN_OP_ADD      0x01
+#define DISKANN_OP_DEL      0x02
+/* ADD is [op][u16 slot][u64 peer][u32 distance bits][edge vector] */
+#define DISKANN_OP_ADD_HDR  15
+#define DISKANN_OP_DEL_SZ   3
+
+#define DISKANN_PLOG_NHASH   4096
+#define DISKANN_PLOG_NLEVEL  32
+#define DISKANN_PLOG_NVICTIM 64
+
+typedef struct DiskAnnDelta DiskAnnDelta;
+typedef struct DiskAnnChain DiskAnnChain;
+
+/* operations recorded for one node by one insert - applied all or nothing */
+struct DiskAnnDelta {
+  DiskAnnDelta *pNext;      /* next group for the same node, in order */
+  u16 nOps;                 /* bytes of aOps */
+  u8 aOps[1];               /* packed operations */
+};
+
+/* everything still pending for one node */
+struct DiskAnnChain {
+  u64 nRowid;
+  DiskAnnChain *pHashNext;
+  DiskAnnChain *pLvlPrev;   /* chains of similar length are kept together so */
+  DiskAnnChain *pLvlNext;   /* the longest can be found without a full scan */
+  DiskAnnDelta *pFirst;
+  DiskAnnDelta *pLast;
+  int nDeltas;
+  int iLevel;               /* highest bit of nDeltas, -1 while unlinked */
+  u32 nBytes;
+};
+
+struct DiskAnnLog {
+  char *zName;              /* index name; key of the global list */
+  DiskAnnLog *pNext;
+  DiskAnnChain **apHash;
+  DiskAnnChain *aLevel[DISKANN_PLOG_NLEVEL];
+  int nChains;
+  u64 nBytes;               /* memory held by pending operations */
+  u64 nBudget;
+  int nMergeMax;
+  u64 iRecRowid;            /* group currently being recorded */
+  u8 *aRec;
+  int nRec;
+  int nRecAlloc;
+  u8 isRecording;
+  u8 isRecFailed;
+  u64 nRecorded;            /* groups recorded */
+  u64 nMerged;              /* blocks written by merge */
+};
+
+/*
+** Logs are global rather than per-DiskAnnIndex: diskAnnOpenIndex() runs once
+** per VDBE cursor, so a run of N separate INSERT statements would otherwise
+** build and discard N independent sets of chains.
+*/
+static DiskAnnLog *diskAnnLogList = 0;
+static int diskAnnPlogState = 0;    /* 0 = not yet read, 1 = on, 2 = off */
+static u64 diskAnnPlogBudget = 0;
+static int diskAnnPlogM = 0;
+
+static int diskAnnPlogEnabled(void){
+  const char *z;
+  if( diskAnnPlogState==0 ){
+    z = getenv("LIBSQL_PLOG");
+    if( z==0 || z[0]==0 || (z[0]=='0' && z[1]==0) ){
+      diskAnnPlogState = 2;
+    }else{
+      diskAnnPlogState = 1;
+      z = getenv("LIBSQL_PLOG_BUDGET");
+      diskAnnPlogBudget = z ? strtoull(z, 0, 10) : (u64)512*1024*1024;
+      if( diskAnnPlogBudget < (1<<20) ) diskAnnPlogBudget = (1<<20);
+      z = getenv("LIBSQL_PLOG_M");
+      diskAnnPlogM = z ? atoi(z) : 2;
+      if( diskAnnPlogM < 1 ) diskAnnPlogM = 1;
+      if( diskAnnPlogM > DISKANN_PLOG_NVICTIM ) diskAnnPlogM = DISKANN_PLOG_NVICTIM;
+    }
+  }
+  return diskAnnPlogState==1;
+}
+
+static DiskAnnLog *diskAnnLogGet(const char *zName){
+  DiskAnnLog *p;
+  for(p=diskAnnLogList; p!=0; p=p->pNext){
+    if( strcmp(p->zName, zName)==0 ) return p;
+  }
+  p = sqlite3_malloc(sizeof(DiskAnnLog));
+  if( p==0 ) return 0;
+  memset(p, 0, sizeof(*p));
+  p->apHash = sqlite3_malloc(DISKANN_PLOG_NHASH * (int)sizeof(DiskAnnChain*));
+  p->zName = sqlite3_mprintf("%s", zName);
+  if( p->apHash==0 || p->zName==0 ){
+    sqlite3_free(p->apHash);
+    sqlite3_free(p->zName);
+    sqlite3_free(p);
+    return 0;
+  }
+  memset(p->apHash, 0, DISKANN_PLOG_NHASH * sizeof(DiskAnnChain*));
+  p->nBudget = diskAnnPlogBudget;
+  p->nMergeMax = diskAnnPlogM;
+  p->pNext = diskAnnLogList;
+  diskAnnLogList = p;
+  return p;
+}
+
+/* rowids are dense, so the low bits spread well enough on their own */
+static DiskAnnChain *diskAnnChainFind(DiskAnnLog *p, u64 nRowid){
+  DiskAnnChain *pChain;
+  for(pChain=p->apHash[nRowid % DISKANN_PLOG_NHASH]; pChain!=0; pChain=pChain->pHashNext){
+    if( pChain->nRowid==nRowid ) return pChain;
+  }
+  return 0;
+}
+
+static void diskAnnChainUnlink(DiskAnnLog *p, DiskAnnChain *pChain){
+  if( pChain->iLevel < 0 ) return;
+  if( pChain->pLvlPrev!=0 ){
+    pChain->pLvlPrev->pLvlNext = pChain->pLvlNext;
+  }else{
+    p->aLevel[pChain->iLevel] = pChain->pLvlNext;
+  }
+  if( pChain->pLvlNext!=0 ){
+    pChain->pLvlNext->pLvlPrev = pChain->pLvlPrev;
+  }
+  pChain->pLvlPrev = 0;
+  pChain->pLvlNext = 0;
+  pChain->iLevel = -1;
+}
+
+static void diskAnnChainLink(DiskAnnLog *p, DiskAnnChain *pChain){
+  int i = 0;
+  int n = pChain->nDeltas;
+  while( (n >>= 1)!=0 ) i++;
+  if( i >= DISKANN_PLOG_NLEVEL ) i = DISKANN_PLOG_NLEVEL - 1;
+  pChain->iLevel = i;
+  pChain->pLvlPrev = 0;
+  pChain->pLvlNext = p->aLevel[i];
+  if( p->aLevel[i]!=0 ) p->aLevel[i]->pLvlPrev = pChain;
+  p->aLevel[i] = pChain;
+}
+
+static void diskAnnChainFree(DiskAnnLog *p, DiskAnnChain *pChain){
+  DiskAnnDelta *pDelta, *pNext;
+  DiskAnnChain **pp;
+
+  for(pDelta=pChain->pFirst; pDelta!=0; pDelta=pNext){
+    pNext = pDelta->pNext;
+    sqlite3_free(pDelta);
+  }
+  diskAnnChainUnlink(p, pChain);
+  for(pp=&p->apHash[pChain->nRowid % DISKANN_PLOG_NHASH]; *pp!=0; pp=&(*pp)->pHashNext){
+    if( *pp==pChain ){
+      *pp = pChain->pHashNext;
+      break;
+    }
+  }
+  p->nBytes -= pChain->nBytes;
+  p->nChains--;
+  sqlite3_free(pChain);
+}
+
+static DiskAnnChain *diskAnnChainGet(DiskAnnLog *p, u64 nRowid){
+  DiskAnnChain *pChain = diskAnnChainFind(p, nRowid);
+  u32 h;
+  if( pChain!=0 ) return pChain;
+  pChain = sqlite3_malloc(sizeof(DiskAnnChain));
+  if( pChain==0 ) return 0;
+  memset(pChain, 0, sizeof(*pChain));
+  pChain->nRowid = nRowid;
+  pChain->iLevel = -1;
+  h = (u32)(nRowid % DISKANN_PLOG_NHASH);
+  pChain->pHashNext = p->apHash[h];
+  p->apHash[h] = pChain;
+  p->nChains++;
+  return pChain;
+}
+
+/* drop anything pending for a node that no longer exists */
+static void diskAnnLogForget(const DiskAnnIndex *pIndex, u64 nRowid){
+  DiskAnnChain *pChain;
+  if( pIndex->pLog==0 ) return;
+  pChain = diskAnnChainFind(pIndex->pLog, nRowid);
+  if( pChain!=0 ) diskAnnChainFree(pIndex->pLog, pChain);
+}
+
+/* drop every chain of an index that is being cleared or dropped */
+static void diskAnnLogForgetAll(const char *zIdxName){
+  DiskAnnLog *p;
+  int i;
+  for(p=diskAnnLogList; p!=0; p=p->pNext){
+    if( strcmp(p->zName, zIdxName)!=0 ) continue;
+    for(i=0; i<DISKANN_PLOG_NHASH; i++){
+      while( p->apHash[i]!=0 ) diskAnnChainFree(p, p->apHash[i]);
+    }
+    p->isRecording = 0;
+    p->nRec = 0;
+    return;
+  }
+}
+
+/**************************************************************************
+** Recording
+**************************************************************************/
+
+static int diskAnnRecRoom(DiskAnnLog *p, int n){
+  u8 *aNew;
+  int nNew;
+  if( p->nRec + n <= p->nRecAlloc ) return 0;
+  nNew = p->nRecAlloc!=0 ? p->nRecAlloc*2 : 512;
+  while( nNew < p->nRec + n ) nNew *= 2;
+  aNew = sqlite3_realloc(p->aRec, nNew);
+  if( aNew==0 ){
+    p->isRecFailed = 1;
+    return 1;
+  }
+  p->aRec = aNew;
+  p->nRecAlloc = nNew;
+  return 0;
+}
+
+static void diskAnnRecAdd(
+  const DiskAnnIndex *pIndex,
+  int iSlot,
+  u64 nRowid,
+  float distance,
+  Vector *pVector
+){
+  DiskAnnLog *p = pIndex->pLog;
+  int n = DISKANN_OP_ADD_HDR + pIndex->nEdgeVectorSize;
+  u32 bits;
+  u8 *z;
+
+  if( diskAnnRecRoom(p, n) ) return;
+  z = p->aRec + p->nRec;
+  z[0] = DISKANN_OP_ADD;
+  writeLE16(z + 1, (u16)iSlot);
+  writeLE64(z + 3, nRowid);
+  memcpy(&bits, &distance, sizeof(bits));
+  writeLE32(z + 11, bits);
+  vectorSerializeToBlob(pVector, z + DISKANN_OP_ADD_HDR, pIndex->nEdgeVectorSize);
+  p->nRec += n;
+}
+
+static void diskAnnRecDel(const DiskAnnIndex *pIndex, int iSlot){
+  DiskAnnLog *p = pIndex->pLog;
+  u8 *z;
+
+  if( diskAnnRecRoom(p, DISKANN_OP_DEL_SZ) ) return;
+  z = p->aRec + p->nRec;
+  z[0] = DISKANN_OP_DEL;
+  writeLE16(z + 1, (u16)iSlot);
+  p->nRec += DISKANN_OP_DEL_SZ;
+}
+
+static void diskAnnRecBegin(const DiskAnnIndex *pIndex, u64 nRowid){
+  DiskAnnLog *p = pIndex->pLog;
+  assert( p!=0 );
+  assert( p->isRecording==0 );
+  p->iRecRowid = nRowid;
+  p->nRec = 0;
+  p->isRecFailed = 0;
+  p->isRecording = 1;
+}
+
+/* leaving a group open would make the next one record into it */
+static void diskAnnRecEnd(const DiskAnnIndex *pIndex){
+  if( pIndex->pLog!=0 ){
+    pIndex->pLog->isRecording = 0;
+    pIndex->pLog->nRec = 0;
+  }
+}
+
+/*
+** Close the group opened by diskAnnRecBegin().  If it could not be recorded,
+** write the block instead: the buffer already holds the up to date content,
+** because reload replayed everything pending before this insert touched it,
+** so flushing it is exactly a merge of that node.
+*/
+static int diskAnnRecCommit(DiskAnnIndex *pIndex, BlobSpot *pBlobSpot){
+  DiskAnnLog *p = pIndex->pLog;
+  DiskAnnDelta *pDelta = 0;
+  DiskAnnChain *pChain = 0;
+  u32 nGrow;
+  int rc;
+
+  p->isRecording = 0;
+  assert( p->nRec <= 0xffff );
+  if( !p->isRecFailed && p->nRec>0 ){
+    pDelta = sqlite3_malloc((int)(sizeof(DiskAnnDelta) + p->nRec));
+    if( pDelta!=0 ) pChain = diskAnnChainGet(p, p->iRecRowid);
+  }
+  if( pChain==0 ){
+    sqlite3_free(pDelta);
+    rc = blobSpotFlush(pIndex, pBlobSpot);
+    if( rc==SQLITE_OK ){
+      diskAnnLogForget(pIndex, p->iRecRowid);
+      p->nMerged++;
+    }
+    return rc;
+  }
+
+  pDelta->pNext = 0;
+  pDelta->nOps = (u16)p->nRec;
+  memcpy(pDelta->aOps, p->aRec, p->nRec);
+
+  diskAnnChainUnlink(p, pChain);
+  if( pChain->pLast!=0 ){
+    pChain->pLast->pNext = pDelta;
+  }else{
+    pChain->pFirst = pDelta;
+  }
+  pChain->pLast = pDelta;
+  pChain->nDeltas++;
+  nGrow = (u32)(sizeof(DiskAnnDelta) + p->nRec);
+  pChain->nBytes += nGrow;
+  p->nBytes += nGrow;
+  diskAnnChainLink(p, pChain);
+  p->nRecorded++;
+  return SQLITE_OK;
+}
+
+/**************************************************************************
+** Replay
+**************************************************************************/
+
+/*
+** Bring a freshly read block up to date.  Called from blobSpotReload() for
+** every node load, so search, insert and merge all see the same state.
+*/
+static void diskAnnApplyDeltas(DiskAnnIndex *pIndex, BlobSpot *pBlobSpot, u64 nRowid){
+  DiskAnnLog *p = pIndex->pLog;
+  DiskAnnChain *pChain;
+  DiskAnnDelta *pDelta;
+  u8 wasRecording;
+
+  if( p==0 ) return;
+  pChain = diskAnnChainFind(p, nRowid);
+  if( pChain==0 ) return;
+
+  wasRecording = p->isRecording;
+  p->isRecording = 0;
+  for(pDelta=pChain->pFirst; pDelta!=0; pDelta=pDelta->pNext){
+    const u8 *z = pDelta->aOps;
+    const u8 *zEnd = z + pDelta->nOps;
+    while( z<zEnd ){
+      if( z[0]==DISKANN_OP_ADD ){
+        Vector v;
+        float distance;
+        u32 bits = readLE32(z + 11);
+        memcpy(&distance, &bits, sizeof(distance));
+        vectorInitStatic(&v, pIndex->nEdgeVectorType, pIndex->nVectorDims,
+                         (void*)(z + DISKANN_OP_ADD_HDR));
+        nodeBinReplaceEdge(pIndex, pBlobSpot, (int)readLE16(z + 1),
+                           readLE64(z + 3), distance, &v);
+        z += DISKANN_OP_ADD_HDR + pIndex->nEdgeVectorSize;
+      }else{
+        assert( z[0]==DISKANN_OP_DEL );
+        nodeBinDeleteEdge(pIndex, pBlobSpot, (int)readLE16(z + 1));
+        z += DISKANN_OP_DEL_SZ;
+      }
+    }
+  }
+  p->isRecording = wasRecording;
+}
+
+/**************************************************************************
+** Merge
+**************************************************************************/
+
+static int diskAnnMergeChain(DiskAnnIndex *pIndex, DiskAnnChain *pChain){
+  BlobSpot *pBlobSpot = 0;
+  u64 nRowid = pChain->nRowid;
+  int rc;
+
+  rc = blobSpotCreate(pIndex, &pBlobSpot, nRowid, pIndex->nBlockSize, DISKANN_BLOB_WRITABLE);
+  if( rc==DISKANN_ROW_NOT_FOUND ){
+    /* the node is gone - its pending operations have nowhere to land */
+    diskAnnChainFree(pIndex->pLog, pChain);
+    return SQLITE_OK;
+  }
+  if( rc!=SQLITE_OK ) return rc;
+
+  rc = blobSpotReload(pIndex, pBlobSpot, nRowid, pIndex->nBlockSize);  /* replays */
+  if( rc==SQLITE_OK ){
+    rc = blobSpotFlush(pIndex, pBlobSpot);
+  }
+  blobSpotFree(pBlobSpot);
+  if( rc==SQLITE_OK ){
+    diskAnnChainFree(pIndex->pLog, pChain);
+    pIndex->pLog->nMerged++;
+  }
+  return rc;
+}
+
+/*
+** Pick victims from the longest chains, since those amortise the block write
+** over the most operations, but write them in rowid order so the blocks are
+** touched sequentially.
+*/
+static int diskAnnMergeSome(DiskAnnIndex *pIndex, int nMax){
+  DiskAnnLog *p = pIndex->pLog;
+  DiskAnnChain *apVictim[DISKANN_PLOG_NVICTIM];
+  DiskAnnChain *pChain;
+  int nVictim = 0;
+  int i, j, rc = SQLITE_OK;
+
+  if( nMax > DISKANN_PLOG_NVICTIM ) nMax = DISKANN_PLOG_NVICTIM;
+  for(i=DISKANN_PLOG_NLEVEL-1; i>=0 && nVictim<nMax; i--){
+    for(pChain=p->aLevel[i]; pChain!=0 && nVictim<nMax; pChain=pChain->pLvlNext){
+      apVictim[nVictim++] = pChain;
+    }
+  }
+  for(i=1; i<nVictim; i++){
+    pChain = apVictim[i];
+    for(j=i; j>0 && apVictim[j-1]->nRowid > pChain->nRowid; j--){
+      apVictim[j] = apVictim[j-1];
+    }
+    apVictim[j] = pChain;
+  }
+  for(i=0; i<nVictim && rc==SQLITE_OK; i++){
+    rc = diskAnnMergeChain(pIndex, apVictim[i]);
+  }
+  return rc;
+}
+
+/*
+** Merging writes blocks through the enclosing transaction.  If that is an
+** explicit one and it rolls back, the block writes are undone while the
+** chains we dropped are not - the operations would be gone for good.  So only
+** merge when the statement is its own transaction.
+*/
+static int diskAnnMergeIfNeeded(DiskAnnIndex *pIndex){
+  DiskAnnLog *p = pIndex->pLog;
+  if( p==0 || p->nBytes <= p->nBudget ) return SQLITE_OK;
+  if( !sqlite3_get_autocommit(pIndex->db) ) return SQLITE_OK;
+  return diskAnnMergeSome(pIndex, p->nMergeMax);
+}
+
+int diskAnnMergeAll(DiskAnnIndex *pIndex){
+  DiskAnnLog *p = pIndex->pLog;
+  int rc = SQLITE_OK;
+  int nPrev;
+
+  if( p==0 ) return SQLITE_OK;
+  while( p->nChains>0 && rc==SQLITE_OK ){
+    nPrev = p->nChains;
+    rc = diskAnnMergeSome(pIndex, DISKANN_PLOG_NVICTIM);
+    if( p->nChains==nPrev ) break;   /* no progress; do not spin */
+  }
+  return rc;
+}
+
 
 typedef struct VectorPair VectorPair;
 typedef struct DiskAnnSearchCtx DiskAnnSearchCtx;
@@ -387,6 +876,10 @@ int blobSpotReload(DiskAnnIndex *pIndex, BlobSpot *pBlobSpot, u64 nRowid, int nB
   }
   pIndex->nReads++;
   DISKANN_STAT_READ(pIndex);
+  /* the block on disk may be behind: bring it up to date in the buffer.  This
+  ** has to sit after the early return above, or a block that is already
+  ** current would have its pending operations applied twice. */
+  diskAnnApplyDeltas(pIndex, pBlobSpot, nRowid);
   pBlobSpot->isInitialized = 1;
   return SQLITE_OK;
 
@@ -541,6 +1034,10 @@ void nodeBinReplaceEdge(const DiskAnnIndex *pIndex, BlobSpot *pBlobSpot, int iRe
   writeLE64(pBlobSpot->pBuffer + edgeMetaOffset + sizeof(u64), nRowid);
 
   writeLE16(pBlobSpot->pBuffer + sizeof(u64), nEdges);
+
+  if( pIndex->pLog!=0 && pIndex->pLog->isRecording ){
+    diskAnnRecAdd(pIndex, iReplace, nRowid, distance, pVector);
+  }
 }
 
 // delete edge at position iDelete by swapping it with the last edge
@@ -566,6 +1063,10 @@ void nodeBinDeleteEdge(const DiskAnnIndex *pIndex, BlobSpot *pBlobSpot, int iDel
   }
 
   writeLE16(pBlobSpot->pBuffer + sizeof(u64), nEdges - 1);
+
+  if( pIndex->pLog!=0 && pIndex->pLog->isRecording ){
+    diskAnnRecDel(pIndex, iDelete);
+  }
 }
 
 void nodeBinDebug(const DiskAnnIndex *pIndex, const BlobSpot *pBlobSpot) {
@@ -728,6 +1229,7 @@ int diskAnnClearIndex(sqlite3 *db, const char *zDbSName, const char *zIdxName) {
   char *zSql = sqlite3MPrintf(db, "DELETE FROM \"%w\".%s_shadow", zDbSName, zIdxName);
   int rc = sqlite3_exec(db, zSql, 0, 0, 0);
   sqlite3DbFree(db, zSql);
+  diskAnnLogForgetAll(zIdxName);
   return rc;
 }
 
@@ -735,6 +1237,7 @@ int diskAnnDropIndex(sqlite3 *db, const char *zDbSName, const char *zIdxName){
   char *zSql = sqlite3MPrintf(db, "DROP TABLE \"%w\".%s_shadow", zDbSName, zIdxName);
   int rc = sqlite3_exec(db, zSql, 0, 0, 0);
   sqlite3DbFree(db, zSql);
+  diskAnnLogForgetAll(zIdxName);
   return rc;
 }
 
@@ -1748,10 +2251,19 @@ int diskAnnInsert(
     if( iReplace == -1 ){
       continue;
     }
+    /* with logging on this is the one place that records: the new node's own
+    ** block, built in the first pass, is written out in full below */
+    if( pIndex->pLog!=0 ){
+      diskAnnRecBegin(pIndex, pVisited->nRowid);
+    }
     nodeBinReplaceEdge(pIndex, pVisited->pBlobSpot, iReplace, nNewRowid, nodeToNew, vInsert.pEdge);
     diskAnnPruneEdges(pIndex, pVisited->pBlobSpot, iReplace, &vCandidate);
 
-    rc = blobSpotFlush(pIndex, pVisited->pBlobSpot);
+    if( pIndex->pLog!=0 ){
+      rc = diskAnnRecCommit(pIndex, pVisited->pBlobSpot);
+    }else{
+      rc = blobSpotFlush(pIndex, pVisited->pBlobSpot);
+    }
     if( rc != SQLITE_OK ){
       *pzErrMsg = sqlite3_mprintf("vector index(insert): failed to flush blob");
       goto out;
@@ -1761,6 +2273,7 @@ int diskAnnInsert(
 
   rc = SQLITE_OK;
 out:
+  diskAnnRecEnd(pIndex);   /* an error above may have left a group open */
   deinitVectorPair(&vInsert);
   deinitVectorPair(&vCandidate);
   if( rc == SQLITE_OK ){
@@ -1775,6 +2288,14 @@ out:
     blobSpotFree(pBlobSpot);
   }
   diskAnnSearchCtxDeinit(&ctx);
+  /* nothing is held open here, which is why the merge happens at this point
+  ** and not inside the loop above */
+  if( rc == SQLITE_OK ){
+    rc = diskAnnMergeIfNeeded(pIndex);
+    if( rc != SQLITE_OK ){
+      *pzErrMsg = sqlite3_mprintf("vector index(insert): failed to merge pending edges");
+    }
+  }
   return rc;
 }
 
@@ -1846,6 +2367,8 @@ int diskAnnDelete(
     *pzErrMsg = sqlite3_mprintf("vector index(delete): failed to remove shadow row");
     goto out;
   }
+  /* the block is gone, so anything still pending for it has nowhere to land */
+  diskAnnLogForget(pIndex, nodeRowid);
 
   rc = SQLITE_OK;
 out:
@@ -1874,6 +2397,7 @@ int diskAnnOpenIndex(
     return SQLITE_NOMEM;
   }
   pIndex->db = db;
+  pIndex->pLog = 0;
   pIndex->zDbSName = sqlite3DbStrDup(db, zDbSName);
   pIndex->zName = sqlite3DbStrDup(db, zIdxName);
   pIndex->zShadow = sqlite3MPrintf(db, "%s_shadow", zIdxName);
@@ -1923,6 +2447,16 @@ int diskAnnOpenIndex(
   }else{
     pIndex->nEdgeVectorType = compressNeighbours;
     pIndex->nEdgeVectorSize = vectorDataSize(compressNeighbours, pIndex->nVectorDims);
+  }
+
+  /* the pending-operation chains outlive this handle: diskAnnOpenIndex runs
+  ** once per VDBE cursor, so they are keyed by index name instead */
+  if( diskAnnPlogEnabled() ){
+    pIndex->pLog = diskAnnLogGet(zIdxName);
+    if( pIndex->pLog==0 ){
+      diskAnnCloseIndex(pIndex);
+      return SQLITE_NOMEM_BKPT;
+    }
   }
 
   *ppIndex = pIndex;
