@@ -221,8 +221,11 @@ static void diskAnnStatInit(const DiskAnnIndex *pIndex){
 **   LIBSQL_PLOG_BUDGET  bytes of pending operations to hold (default 512M)
 **   LIBSQL_PLOG_M       nodes merged per insert once over budget (default 2)
 */
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 /* defined with the rest of the serialisation helpers further down */
 static inline u16 readLE16(const unsigned char*);
@@ -242,12 +245,31 @@ static inline void writeLE64(unsigned char*, u64);
 #define DISKANN_PLOG_NLEVEL  32
 #define DISKANN_PLOG_NVICTIM 64
 
+/*
+** Log file layout.  Header once at the front, then frames appended forever;
+** nothing already written is ever modified.  A frame's LSN is its position,
+** so it is not stored:  LSN = iFirstLsn + (file offset - DISKANN_LOG_HDR).
+**
+** The node LSN that makes replay idempotent goes in six bytes of the block
+** header that format 3 leaves unused (rowid at 0..7, edge count at 8..9),
+** so no block grows and no format version changes.
+*/
+#define DISKANN_LOG_MAGIC    "LDLOG\0\0\1"
+#define DISKANN_LOG_HDR      48
+#define DISKANN_LOG_FRAME    16    /* u16 len, u8 type, u8 flags, u64 rowid, u32 crc */
+#define DISKANN_LOG_DELTA    1
+#define DISKANN_LOG_COMMIT   2
+#define DISKANN_LOG_MERGED   3    /* node folded in; earlier groups are dead */
+#define DISKANN_NODELSN_OFF  10
+#define DISKANN_NODELSN_MAX  0xffffffffffffull
+
 typedef struct DiskAnnDelta DiskAnnDelta;
 typedef struct DiskAnnChain DiskAnnChain;
 
 /* operations recorded for one node by one insert - applied all or nothing */
 struct DiskAnnDelta {
   DiskAnnDelta *pNext;      /* next group for the same node, in order */
+  u64 iLsn;                 /* position of this group in the log */
   u16 nOps;                 /* bytes of aOps */
   u8 aOps[1];               /* packed operations */
 };
@@ -282,7 +304,31 @@ struct DiskAnnLog {
   u8 isRecFailed;
   u64 nRecorded;            /* groups recorded */
   u64 nMerged;              /* blocks written by merge */
+  u64 nBytesPeak;           /* high water mark of nBytes */
+
+  /* the log file: where the operations go so a crash does not lose them.
+  ** fd < 0 means they are only in memory - the log could not be opened, or
+  ** the block format has no room for a node LSN. */
+  int fd;
+  u64 iFirstLsn;            /* LSN of the first byte after the file header */
+  u64 iNextLsn;             /* LSN the next group will get */
+  u64 nFileBytes;           /* bytes in the file, header included */
+  u8 *aBuf;                 /* append buffer, flushed in whole units */
+  int nBuf;
+  int nBufAlloc;
+  int syncMode;             /* 0 none, 1 on flush, 2 on every group */
+  int nEdgeVectorSize;      /* recorded in the header so a reopen can check */
+  int nBlockSize;
+  u64 nLogBytes;            /* bytes appended, for reporting */
+  u64 nFlush;               /* write() calls */
+  u64 nSync;                /* fsync() calls */
 };
+
+static void diskAnnChainUnlink(DiskAnnLog*, DiskAnnChain*);
+static void diskAnnChainLink(DiskAnnLog*, DiskAnnChain*);
+static void diskAnnChainFree(DiskAnnLog*, DiskAnnChain*);
+static DiskAnnChain *diskAnnChainGet(DiskAnnLog*, u64);
+static DiskAnnChain *diskAnnChainFind(DiskAnnLog*, u64);
 
 /*
 ** Logs are global rather than per-DiskAnnIndex: diskAnnOpenIndex() runs once
@@ -293,6 +339,8 @@ static DiskAnnLog *diskAnnLogList = 0;
 static int diskAnnPlogState = 0;    /* 0 = not yet read, 1 = on, 2 = off */
 static u64 diskAnnPlogBudget = 0;
 static int diskAnnPlogM = 0;
+static int diskAnnPlogFlushSz = 0;  /* append buffer, the unit of a write() */
+static int diskAnnPlogSyncMode = 0;
 
 static int diskAnnPlogEnabled(void){
   const char *z;
@@ -309,23 +357,291 @@ static int diskAnnPlogEnabled(void){
       diskAnnPlogM = z ? atoi(z) : 2;
       if( diskAnnPlogM < 1 ) diskAnnPlogM = 1;
       if( diskAnnPlogM > DISKANN_PLOG_NVICTIM ) diskAnnPlogM = DISKANN_PLOG_NVICTIM;
+      /* 192K matches the die-level flush unit of the target device; a group
+      ** never exceeds one frame, so the buffer only has to hold that */
+      z = getenv("LIBSQL_PLOG_FLUSH");
+      diskAnnPlogFlushSz = z ? atoi(z) : 192*1024;
+      if( diskAnnPlogFlushSz < 64*1024 ) diskAnnPlogFlushSz = 64*1024;
+      z = getenv("LIBSQL_PLOG_SYNC");
+      if( z==0 ) diskAnnPlogSyncMode = 1;
+      else if( strcmp(z,"off")==0 || strcmp(z,"0")==0 ) diskAnnPlogSyncMode = 0;
+      else if( strcmp(z,"full")==0 || strcmp(z,"2")==0 ) diskAnnPlogSyncMode = 2;
+      else diskAnnPlogSyncMode = 1;
     }
   }
   return diskAnnPlogState==1;
 }
 
-static DiskAnnLog *diskAnnLogGet(const char *zName){
+/**************************************************************************
+** Log file
+**************************************************************************/
+
+static u64 readLE48(const unsigned char *p){
+  return (u64)p[0] | (u64)p[1]<<8 | (u64)p[2]<<16
+       | (u64)p[3]<<24 | (u64)p[4]<<32 | (u64)p[5]<<40;
+}
+static void writeLE48(unsigned char *p, u64 v){
+  p[0]=(u8)v; p[1]=(u8)(v>>8);  p[2]=(u8)(v>>16);
+  p[3]=(u8)(v>>24); p[4]=(u8)(v>>32); p[5]=(u8)(v>>40);
+}
+
+static u32 diskAnnCrcTab[256];
+static int diskAnnCrcReady = 0;
+
+static u32 diskAnnCrc32(const u8 *z, int n){
+  u32 c = 0xffffffff;
+  int i, k;
+  if( !diskAnnCrcReady ){
+    for(i=0; i<256; i++){
+      c = (u32)i;
+      for(k=0; k<8; k++) c = (c&1) ? 0xedb88320u ^ (c>>1) : c>>1;
+      diskAnnCrcTab[i] = c;
+    }
+    diskAnnCrcReady = 1;
+    c = 0xffffffff;
+  }
+  for(i=0; i<n; i++) c = diskAnnCrcTab[(c ^ z[i]) & 0xff] ^ (c>>8);
+  return c ^ 0xffffffff;
+}
+
+/* push the append buffer out; the log must reach disk before any block that
+** depends on it, which is why merges call this first */
+static int diskAnnLogFlush(DiskAnnLog *p){
+  int nDone = 0;
+  if( p->fd<0 || p->nBuf==0 ) return SQLITE_OK;
+  while( nDone < p->nBuf ){
+    ssize_t n = write(p->fd, p->aBuf + nDone, (size_t)(p->nBuf - nDone));
+    if( n<=0 ) return SQLITE_IOERR;
+    nDone += (int)n;
+  }
+  p->nFileBytes += (u64)p->nBuf;
+  p->nLogBytes += (u64)p->nBuf;
+  p->nBuf = 0;
+  p->nFlush++;
+  return SQLITE_OK;
+}
+
+static int diskAnnLogSync(DiskAnnLog *p){
+  if( p->fd<0 ) return SQLITE_OK;
+  if( fsync(p->fd)!=0 ) return SQLITE_IOERR;
+  p->nSync++;
+  return SQLITE_OK;
+}
+
+/* append one frame; the LSN handed back is where it will land in the file */
+static int diskAnnLogAppend(
+  DiskAnnLog *p,
+  int type,
+  u64 nRowid,
+  const u8 *aOps,
+  int nOps,
+  u64 *piLsn
+){
+  int nFrame = DISKANN_LOG_FRAME + nOps;
+  u8 *z;
+  int rc;
+
+  *piLsn = p->iNextLsn;
+  p->iNextLsn += (u64)nFrame;
+  if( p->fd<0 ) return SQLITE_OK;
+
+  if( p->nBuf + nFrame > p->nBufAlloc ){
+    rc = diskAnnLogFlush(p);
+    if( rc!=SQLITE_OK ) return rc;
+    if( nFrame > p->nBufAlloc ) return SQLITE_IOERR;  /* cannot happen */
+  }
+  z = p->aBuf + p->nBuf;
+  writeLE16(z, (u16)nOps);
+  z[2] = (u8)type;
+  z[3] = 0;
+  writeLE64(z + 4, nRowid);
+  if( nOps>0 ) memcpy(z + 12, aOps, (size_t)nOps);
+  writeLE32(z + 12 + nOps, diskAnnCrc32(z, 12 + nOps));
+  p->nBuf += nFrame;
+
+  if( p->syncMode>=2 ){
+    rc = diskAnnLogFlush(p);
+    if( rc==SQLITE_OK ) rc = diskAnnLogSync(p);
+    return rc;
+  }
+  return SQLITE_OK;
+}
+
+/*
+** Read the log back and rebuild the chains.  Stops at the first frame that is
+** cut short or fails its checksum - that is where the last write got to - and
+** trims the file there.  Groups already folded into their block are not
+** filtered out here; replay skips them by comparing against the node LSN.
+*/
+static int diskAnnLogRecover(DiskAnnLog *p, const DiskAnnIndex *pIndex){
+  u8 aHdr[DISKANN_LOG_HDR];
+  u8 *aFrame = 0;
+  off_t nSize, off;
+  int nMax, rc = SQLITE_OK;
+
+  nSize = lseek(p->fd, 0, SEEK_END);
+  if( nSize < DISKANN_LOG_HDR ){
+    p->nFileBytes = 0;                 /* empty or truncated - start over */
+    return SQLITE_OK;
+  }
+  if( pread(p->fd, aHdr, DISKANN_LOG_HDR, 0)!=DISKANN_LOG_HDR ) return SQLITE_IOERR;
+  if( memcmp(aHdr, DISKANN_LOG_MAGIC, 8)!=0
+   || readLE32(aHdr+12)!=(u32)pIndex->nEdgeVectorSize
+   || readLE64(aHdr+24)!=(u64)pIndex->nBlockSize
+  ){
+    return SQLITE_CORRUPT;             /* not ours, or the index changed */
+  }
+  p->iFirstLsn = readLE64(aHdr+16);
+
+  nMax = DISKANN_LOG_FRAME + 0x10000;
+  aFrame = sqlite3_malloc(nMax);
+  if( aFrame==0 ) return SQLITE_NOMEM_BKPT;
+
+  for(off=DISKANN_LOG_HDR; off<nSize; ){
+    int nOps, nFrame, type;
+    u64 nRowid, iLsn;
+    if( off + DISKANN_LOG_FRAME > nSize ) break;
+    if( pread(p->fd, aFrame, DISKANN_LOG_FRAME, off)!=DISKANN_LOG_FRAME ) break;
+    nOps = readLE16(aFrame);
+    nFrame = DISKANN_LOG_FRAME + nOps;
+    if( off + nFrame > nSize ) break;
+    if( pread(p->fd, aFrame, (size_t)nFrame, off)!=nFrame ) break;
+    if( readLE32(aFrame + 12 + nOps)!=diskAnnCrc32(aFrame, 12 + nOps) ) break;
+
+    type = aFrame[2];
+    nRowid = readLE64(aFrame + 4);
+    iLsn = p->iFirstLsn + (u64)(off - DISKANN_LOG_HDR);
+    if( type==DISKANN_LOG_MERGED ){
+      /* everything recorded for this node before here is already in its
+      ** block.  Without this the whole log would come back into memory and
+      ** be merged a second time; the node LSN would keep it correct, but at
+      ** the cost of carrying dead groups around. */
+      DiskAnnChain *pChain = diskAnnChainFind(p, nRowid);
+      if( pChain!=0 ) diskAnnChainFree(p, pChain);
+    }else if( type==DISKANN_LOG_DELTA && nOps>0 ){
+      DiskAnnDelta *pDelta = sqlite3_malloc((int)(sizeof(DiskAnnDelta) + nOps));
+      DiskAnnChain *pChain = pDelta ? diskAnnChainGet(p, nRowid) : 0;
+      if( pChain==0 ){
+        sqlite3_free(pDelta);
+        rc = SQLITE_NOMEM_BKPT;
+        break;
+      }
+      pDelta->pNext = 0;
+      pDelta->iLsn = iLsn;
+      pDelta->nOps = (u16)nOps;
+      memcpy(pDelta->aOps, aFrame + 12, (size_t)nOps);
+      diskAnnChainUnlink(p, pChain);
+      if( pChain->pLast!=0 ) pChain->pLast->pNext = pDelta; else pChain->pFirst = pDelta;
+      pChain->pLast = pDelta;
+      pChain->nDeltas++;
+      pChain->nBytes += (u32)(sizeof(DiskAnnDelta) + nOps);
+      p->nBytes += (u64)(sizeof(DiskAnnDelta) + nOps);
+      diskAnnChainLink(p, pChain);
+    }
+    off += nFrame;
+  }
+  sqlite3_free(aFrame);
+
+  p->nFileBytes = (u64)off;
+  p->iNextLsn = p->iFirstLsn + (u64)(off - DISKANN_LOG_HDR);
+  if( off < nSize ) ftruncate(p->fd, off);   /* drop the torn tail */
+  lseek(p->fd, off, SEEK_SET);
+  if( p->nBytes > p->nBytesPeak ) p->nBytesPeak = p->nBytes;
+  return rc;
+}
+
+/*
+** Start the file over once nothing is pending.  LSNs keep climbing across the
+** reset: restarting them would make a block's stored node LSN look newer than
+** the groups that come after it, and replay would skip them.
+*/
+static void diskAnnLogTruncate(DiskAnnLog *p){
+  u8 aHdr[DISKANN_LOG_HDR];
+  if( p->fd<0 || p->nChains>0 ) return;
+  if( diskAnnLogFlush(p)!=SQLITE_OK ) return;
+  memset(aHdr, 0, sizeof(aHdr));
+  memcpy(aHdr, DISKANN_LOG_MAGIC, 8);
+  writeLE32(aHdr+8, 1);
+  writeLE32(aHdr+12, p->nEdgeVectorSize);
+  writeLE64(aHdr+16, p->iNextLsn);
+  writeLE64(aHdr+24, p->nBlockSize);
+  writeLE32(aHdr+32, diskAnnCrc32(aHdr, 32));
+  if( ftruncate(p->fd, DISKANN_LOG_HDR)!=0 ) return;
+  if( pwrite(p->fd, aHdr, DISKANN_LOG_HDR, 0)!=DISKANN_LOG_HDR ) return;
+  p->iFirstLsn = p->iNextLsn;
+  p->nFileBytes = DISKANN_LOG_HDR;
+  lseek(p->fd, DISKANN_LOG_HDR, SEEK_SET);
+}
+
+static int diskAnnLogOpen(DiskAnnLog *p, const DiskAnnIndex *pIndex){
+  const char *zDbFile = sqlite3_db_filename(pIndex->db, pIndex->zDbSName);
+  char *zPath;
+  u8 aHdr[DISKANN_LOG_HDR];
+  int rc;
+
+  p->fd = -1;
+  p->nEdgeVectorSize = pIndex->nEdgeVectorSize;
+  p->nBlockSize = pIndex->nBlockSize;
+
+  /* older block formats have no spare header bytes for the node LSN, and a
+  ** database with no file on disk has nowhere to put the log */
+  if( pIndex->nFormatVersion < VECTOR_FORMAT_DEFAULT ) return SQLITE_OK;
+  if( zDbFile==0 || zDbFile[0]==0 ) return SQLITE_OK;
+
+  zPath = sqlite3_mprintf("%s-plog-%s", zDbFile, pIndex->zName);
+  if( zPath==0 ) return SQLITE_NOMEM_BKPT;
+  p->fd = open(zPath, O_RDWR|O_CREAT, 0644);
+  sqlite3_free(zPath);
+  if( p->fd<0 ) return SQLITE_OK;             /* carry on in memory only */
+
+  p->aBuf = sqlite3_malloc(p->nBufAlloc);
+  if( p->aBuf==0 ){ close(p->fd); p->fd = -1; return SQLITE_NOMEM_BKPT; }
+
+  rc = diskAnnLogRecover(p, pIndex);
+  if( rc==SQLITE_OK && p->nFileBytes>=DISKANN_LOG_HDR ) return SQLITE_OK;
+  if( rc!=SQLITE_OK && rc!=SQLITE_CORRUPT ) return rc;
+
+  /* fresh or unusable: lay down a new header */
+  memset(aHdr, 0, sizeof(aHdr));
+  memcpy(aHdr, DISKANN_LOG_MAGIC, 8);
+  writeLE32(aHdr+8, 1);
+  writeLE32(aHdr+12, p->nEdgeVectorSize);
+  writeLE64(aHdr+16, 0);
+  writeLE64(aHdr+24, p->nBlockSize);
+  writeLE32(aHdr+32, diskAnnCrc32(aHdr, 32));
+  if( ftruncate(p->fd, 0)!=0
+   || pwrite(p->fd, aHdr, DISKANN_LOG_HDR, 0)!=DISKANN_LOG_HDR ){
+    close(p->fd);
+    p->fd = -1;
+    return SQLITE_OK;
+  }
+  p->iFirstLsn = 0;
+  p->iNextLsn = 0;
+  p->nFileBytes = DISKANN_LOG_HDR;
+  lseek(p->fd, DISKANN_LOG_HDR, SEEK_SET);
+  return SQLITE_OK;
+}
+
+static DiskAnnLog *diskAnnLogGet(const DiskAnnIndex *pIndex){
+  const char *zDbFile = sqlite3_db_filename(pIndex->db, pIndex->zDbSName);
   DiskAnnLog *p;
+  char *zKey;
+
+  zKey = sqlite3_mprintf("%s|%s", zDbFile ? zDbFile : "", pIndex->zName);
+  if( zKey==0 ) return 0;
   for(p=diskAnnLogList; p!=0; p=p->pNext){
-    if( strcmp(p->zName, zName)==0 ) return p;
+    if( strcmp(p->zName, zKey)==0 ){
+      sqlite3_free(zKey);
+      return p;
+    }
   }
   p = sqlite3_malloc(sizeof(DiskAnnLog));
-  if( p==0 ) return 0;
+  if( p==0 ){ sqlite3_free(zKey); return 0; }
   memset(p, 0, sizeof(*p));
+  p->zName = zKey;
+  p->fd = -1;
   p->apHash = sqlite3_malloc(DISKANN_PLOG_NHASH * (int)sizeof(DiskAnnChain*));
-  p->zName = sqlite3_mprintf("%s", zName);
-  if( p->apHash==0 || p->zName==0 ){
-    sqlite3_free(p->apHash);
+  if( p->apHash==0 ){
     sqlite3_free(p->zName);
     sqlite3_free(p);
     return 0;
@@ -333,8 +649,11 @@ static DiskAnnLog *diskAnnLogGet(const char *zName){
   memset(p->apHash, 0, DISKANN_PLOG_NHASH * sizeof(DiskAnnChain*));
   p->nBudget = diskAnnPlogBudget;
   p->nMergeMax = diskAnnPlogM;
+  p->nBufAlloc = diskAnnPlogFlushSz;
+  p->syncMode = diskAnnPlogSyncMode;
   p->pNext = diskAnnLogList;
   diskAnnLogList = p;
+  diskAnnLogOpen(p, pIndex);
   return p;
 }
 
@@ -418,17 +737,22 @@ static void diskAnnLogForget(const DiskAnnIndex *pIndex, u64 nRowid){
   if( pChain!=0 ) diskAnnChainFree(pIndex->pLog, pChain);
 }
 
-/* drop every chain of an index that is being cleared or dropped */
+/* drop every chain of an index that is being cleared or dropped.  Logs are
+** keyed "<db file>|<index>", so match on the part after the bar. */
 static void diskAnnLogForgetAll(const char *zIdxName){
   DiskAnnLog *p;
+  const char *zBar;
   int i;
   for(p=diskAnnLogList; p!=0; p=p->pNext){
-    if( strcmp(p->zName, zIdxName)!=0 ) continue;
+    zBar = strrchr(p->zName, '|');
+    if( zBar==0 || strcmp(zBar+1, zIdxName)!=0 ) continue;
     for(i=0; i<DISKANN_PLOG_NHASH; i++){
       while( p->apHash[i]!=0 ) diskAnnChainFree(p, p->apHash[i]);
     }
     p->isRecording = 0;
     p->nRec = 0;
+    p->nBuf = 0;
+    diskAnnLogTruncate(p);
     return;
   }
 }
@@ -537,6 +861,8 @@ static int diskAnnRecCommit(DiskAnnIndex *pIndex, BlobSpot *pBlobSpot){
   pDelta->pNext = 0;
   pDelta->nOps = (u16)p->nRec;
   memcpy(pDelta->aOps, p->aRec, p->nRec);
+  diskAnnLogAppend(p, DISKANN_LOG_DELTA, p->iRecRowid, p->aRec, p->nRec,
+                   &pDelta->iLsn);
 
   diskAnnChainUnlink(p, pChain);
   if( pChain->pLast!=0 ){
@@ -551,6 +877,7 @@ static int diskAnnRecCommit(DiskAnnIndex *pIndex, BlobSpot *pBlobSpot){
   p->nBytes += nGrow;
   diskAnnChainLink(p, pChain);
   p->nRecorded++;
+  if( p->nBytes > p->nBytesPeak ) p->nBytesPeak = p->nBytes;
   return SQLITE_OK;
 }
 
@@ -566,17 +893,23 @@ static void diskAnnApplyDeltas(DiskAnnIndex *pIndex, BlobSpot *pBlobSpot, u64 nR
   DiskAnnLog *p = pIndex->pLog;
   DiskAnnChain *pChain;
   DiskAnnDelta *pDelta;
+  u64 nodeLsn;
   u8 wasRecording;
 
   if( p==0 ) return;
   pChain = diskAnnChainFind(p, nRowid);
   if( pChain==0 ) return;
 
+  /* groups up to this point are already folded into the block on disk; this
+  ** is what lets the log be replayed from the start without doubling up */
+  nodeLsn = p->fd>=0 ? readLE48(pBlobSpot->pBuffer + DISKANN_NODELSN_OFF) : 0;
+
   wasRecording = p->isRecording;
   p->isRecording = 0;
   for(pDelta=pChain->pFirst; pDelta!=0; pDelta=pDelta->pNext){
     const u8 *z = pDelta->aOps;
     const u8 *zEnd = z + pDelta->nOps;
+    if( p->fd>=0 && pDelta->iLsn < nodeLsn ) continue;
     while( z<zEnd ){
       if( z[0]==DISKANN_OP_ADD ){
         Vector v;
@@ -617,10 +950,25 @@ static int diskAnnMergeChain(DiskAnnIndex *pIndex, DiskAnnChain *pChain){
 
   rc = blobSpotReload(pIndex, pBlobSpot, nRowid, pIndex->nBlockSize);  /* replays */
   if( rc==SQLITE_OK ){
+    /* mark how far the block has caught up, so a later replay skips what is
+    ** now baked into it.  One past the last group applied: a fresh block
+    ** reads zero here and must not skip the group that happens to sit at
+    ** LSN 0. */
+    if( pIndex->pLog->fd>=0 ){
+      u64 iUpto = pChain->pLast->iLsn + 1;
+      assert( iUpto <= DISKANN_NODELSN_MAX );
+      writeLE48(pBlobSpot->pBuffer + DISKANN_NODELSN_OFF, iUpto);
+    }
     rc = blobSpotFlush(pIndex, pBlobSpot);
   }
   blobSpotFree(pBlobSpot);
   if( rc==SQLITE_OK ){
+    /* only once the block is safely written - if this went first and the
+    ** write then failed, recovery would drop groups that never landed */
+    if( pIndex->pLog->fd>=0 ){
+      u64 iDummy;
+      diskAnnLogAppend(pIndex->pLog, DISKANN_LOG_MERGED, nRowid, 0, 0, &iDummy);
+    }
     diskAnnChainFree(pIndex->pLog, pChain);
     pIndex->pLog->nMerged++;
   }
@@ -638,6 +986,15 @@ static int diskAnnMergeSome(DiskAnnIndex *pIndex, int nMax){
   DiskAnnChain *pChain;
   int nVictim = 0;
   int i, j, rc = SQLITE_OK;
+
+  /* the log has to be on disk before any block that depends on it: if a block
+  ** came first and the machine died, its node LSN would claim operations that
+  ** the log never recorded */
+  if( p->fd>=0 ){
+    rc = diskAnnLogFlush(p);
+    if( rc==SQLITE_OK && p->syncMode>0 ) rc = diskAnnLogSync(p);
+    if( rc!=SQLITE_OK ) return rc;
+  }
 
   if( nMax > DISKANN_PLOG_NVICTIM ) nMax = DISKANN_PLOG_NVICTIM;
   for(i=DISKANN_PLOG_NLEVEL-1; i>=0 && nVictim<nMax; i--){
@@ -682,6 +1039,26 @@ int diskAnnMergeAll(DiskAnnIndex *pIndex){
     rc = diskAnnMergeSome(pIndex, DISKANN_PLOG_NVICTIM);
     if( p->nChains==nPrev ) break;   /* no progress; do not spin */
   }
+  if( p->nChains==0 ) diskAnnLogTruncate(p);
+  /* the only place these numbers get out: the SQL wrapper's return value is
+  ** discarded when the statement is run with sqlite3_exec() */
+  fprintf(stderr,
+    "plog: edge-updates=%llu  block-writes=%llu  ratio=%.2fx\n"
+    "      log=%.1fMB in %llu writes, %llu fsyncs (buf=%dKB sync=%s%s)\n"
+    "      peak-mem=%.1fMB budget=%.0fMB M=%d chains-left=%d\n",
+    (unsigned long long)p->nRecorded,
+    (unsigned long long)p->nMerged,
+    p->nMerged ? (double)p->nRecorded / (double)p->nMerged : 0.0,
+    p->nLogBytes / 1048576.0,
+    (unsigned long long)p->nFlush,
+    (unsigned long long)p->nSync,
+    p->nBufAlloc / 1024,
+    p->syncMode==0 ? "off" : p->syncMode==2 ? "full" : "normal",
+    p->fd<0 ? ", MEMORY ONLY - no log file" : "",
+    p->nBytesPeak / 1048576.0,
+    p->nBudget / 1048576.0,
+    p->nMergeMax,
+    p->nChains);
   return rc;
 }
 
@@ -2452,7 +2829,7 @@ int diskAnnOpenIndex(
   /* the pending-operation chains outlive this handle: diskAnnOpenIndex runs
   ** once per VDBE cursor, so they are keyed by index name instead */
   if( diskAnnPlogEnabled() ){
-    pIndex->pLog = diskAnnLogGet(zIdxName);
+    pIndex->pLog = diskAnnLogGet(pIndex);
     if( pIndex->pLog==0 ){
       diskAnnCloseIndex(pIndex);
       return SQLITE_NOMEM_BKPT;
