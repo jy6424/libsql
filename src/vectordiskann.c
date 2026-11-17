@@ -544,7 +544,11 @@ static int diskAnnLogRecover(DiskAnnLog *p, const DiskAnnIndex *pIndex){
 
   p->nFileBytes = (u64)off;
   p->iNextLsn = p->iFirstLsn + (u64)(off - DISKANN_LOG_HDR);
-  if( off < nSize ) ftruncate(p->fd, off);   /* drop the torn tail */
+  /* Cut off whatever follows the last good frame.  Leaving it would be worse
+  ** than it looks: those bytes were a valid frame once, so a later recovery
+  ** could parse one of them, checksum and all, and replay operations that
+  ** have since been superseded. */
+  if( off < nSize && ftruncate(p->fd, off)!=0 ) return SQLITE_IOERR;
   lseek(p->fd, off, SEEK_SET);
   if( p->nBytes > p->nBytesPeak ) p->nBytesPeak = p->nBytes;
   return rc;
@@ -653,7 +657,12 @@ static DiskAnnLog *diskAnnLogGet(const DiskAnnIndex *pIndex){
   p->syncMode = diskAnnPlogSyncMode;
   p->pNext = diskAnnLogList;
   diskAnnLogList = p;
-  diskAnnLogOpen(p, pIndex);
+  /* a log we cannot trust is worse than none: carry on in memory, which the
+  ** summary line reports so it does not pass unnoticed */
+  if( diskAnnLogOpen(p, pIndex)!=SQLITE_OK && p->fd>=0 ){
+    close(p->fd);
+    p->fd = -1;
+  }
   return p;
 }
 
