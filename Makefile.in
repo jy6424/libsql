@@ -1269,7 +1269,11 @@ parse.c:	$(TOP)/src/parse.y lemon$(BEXE)
 	cp $(TOP)/src/parse.y .
 	./lemon$(BEXE) $(OPT_FEATURE_FLAGS) $(OPTS) -S parse.y
 
-sqlite3.h:	$(TOP)/src/sqlite.h.in $(TOP)/manifest mksourceid$(BEXE) $(TOP)/VERSION has_tclsh84
+# page_header.h and wal.h are copied into sqlite3.h by mksqlite3h.tcl, so a
+# change to either has to regenerate it.  Without them here the struct
+# definitions they carry go stale in every translation unit that reaches them
+# through sqlite3.h while the rest of the build sees the new ones.
+sqlite3.h:	$(TOP)/src/sqlite.h.in $(TOP)/manifest mksourceid$(BEXE) $(TOP)/VERSION has_tclsh84 $(TOP)/src/page_header.h $(TOP)/src/wal.h
 	$(TCLSH_CMD) $(TOP)/tool/mksqlite3h.tcl $(TOP) >sqlite3.h
 
 sqlite3rc.h:	$(TOP)/src/sqlite3.rc $(TOP)/VERSION has_tclsh84

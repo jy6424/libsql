@@ -629,8 +629,8 @@ struct PagerSavepoint {
 **
 ** A page arrives at the log in one of two states:
 **
-**   isWhole, or no delta at all     log the whole page
-**   nRange ranges                   log only those bytes
+**   plogWhole, or no ranges          log the whole page
+**   plogNRange ranges                log only those bytes
 **
 ** Whole is the default and it is sticky.  Every write that does not declare
 ** an extent - a cell header, the freelist, a pointer map, the change counter
@@ -639,27 +639,26 @@ struct PagerSavepoint {
 ** wrong in the narrowing direction therefore costs bytes and never loses a
 ** change; that is the only way this is allowed to fail.
 **
-** One node per page declared, released when the transaction ends.
+** The ranges live in libsql_pghdr itself, not in an allocation hanging off
+** it.  A page stays in the cache after the transaction that wrote it ends, so
+** anything allocated per transaction and released at its end would leave the
+** header pointing at freed memory - and the stamp that says "this is stale"
+** would itself be in that freed memory.  Inline, the generation can always be
+** read.
 */
-typedef struct PagerDelta PagerDelta;
-struct PagerDelta {
-  PagerDelta *pNext;
-  libsql_page_delta d;        /* Over-allocated for PAGER_PLOG_MAXRANGE */
-};
 
-/* Ranges one page is allowed to report.  An edge update declares three and
-** they merge down to three distinct pages, so this is far above what the
-** workload needs; a page that fragments past it is logged whole, which is
-** correct, just larger than it needs to be. */
-#define PAGER_PLOG_MAXRANGE 32
+/* Ranges one page may report before it is logged whole instead.  An edge
+** update declares three and they fall in three different pages, so one or two
+** per page is what the workload produces. */
+#define PAGER_PLOG_MAXRANGE 8
 #ifndef SQLITE_OMIT_WAL
-static void pagerDeltaClear(Pager*);
 static void pagerDeltaWhole(Pager*, PgHdr*);
 static void pagerDeltaRange(Pager*, PgHdr*, int, int);
+static void pagerDeltaClear(Pager*);
 #else
-# define pagerDeltaClear(A)
 # define pagerDeltaWhole(A,B)
 # define pagerDeltaRange(A,B,C,D)
+# define pagerDeltaClear(A)
 #endif
 
 struct Pager {
@@ -751,8 +750,7 @@ struct Pager {
                                 We leave it temporarily to keep sqlite3_filename_wal working
                               */
 #endif
-  PagerDelta *pDeltaList;     /* Page deltas for this transaction; see plog.c */
-  u32 iDeltaGen;              /* Bumped per transaction, to stale old deltas */
+  u32 iDeltaGen;              /* Bumped per transaction; see plog.c */
 };
 
 
@@ -3251,8 +3249,9 @@ static int pagerRollbackWal(Pager *pPager){
 
 #ifndef SQLITE_OMIT_WAL
 /*
-** Delta bookkeeping for physiological logging.  See the comment on
-** PagerDelta above for what the two states mean and why whole is the default.
+** Delta bookkeeping for physiological logging.  See the comment above
+** PAGER_PLOG_MAXRANGE for what the two states mean and why whole is the
+** default.
 **
 ** LIBSQL_PLOG   enable
 */
@@ -3268,8 +3267,7 @@ static void pagerPlogReport(void){
   struct PagerPlogStat *p = &pagerPlogStat;
   if( p->nPage==0 ) return;
   fprintf(stderr,
-    "plog-decl: pages=%llu  declared-ranges=%llu  whole=%llu (%.1f%%)"
-    "  overflow=%llu\n",
+    "plog-decl: pages=%llu  ranges=%llu  whole=%llu (%.1f%%)  overflow=%llu\n",
     (unsigned long long)p->nPage,
     (unsigned long long)(p->nPage - p->nWhole),
     (unsigned long long)p->nWhole, 100.0*p->nWhole/(double)p->nPage,
@@ -3291,37 +3289,17 @@ static int pagerPlogEnabled(void){
 }
 
 /*
-** The delta pPg is accumulating in this transaction, created on the first
-** declaration.  Returns 0 if the allocation failed, and the caller then
-** leaves the page whole, which is always correct.
+** Start pPg's range list for this transaction if it has not been touched yet.
+** The generation stamp is what distinguishes that from a list left over from
+** an earlier transaction, which must not be added to.
 */
-static libsql_page_delta *pagerDeltaOf(Pager *pPager, PgHdr *pPg){
-  PagerDelta *p;
-  libsql_page_delta *pD = (libsql_page_delta*)pPg->pPlogDelta;
-
-  /* A page that stays in the cache across transactions still points at the
-  ** delta that was freed at the end of the last one, so the generation has to
-  ** be checked and not just the page number. */
-  if( pD!=0 && pD->iGen==pPager->iDeltaGen && pD->pgno==pPg->pgno ){
-    return pD;
+static void pagerDeltaOpen(Pager *pPager, PgHdr *pPg){
+  if( pPg->plogGen!=pPager->iDeltaGen ){
+    pPg->plogGen = pPager->iDeltaGen;
+    pPg->plogWhole = 0;
+    pPg->plogNRange = 0;
+    pagerPlogStat.nPage++;
   }
-  p = sqlite3_malloc(sizeof(*p) + (2*PAGER_PLOG_MAXRANGE-2)*sizeof(u16));
-  if( p==0 ){
-    pPg->pPlogDelta = 0;      /* no delta: plog.c logs the whole page */
-    return 0;
-  }
-  pD = &p->d;
-  pD->iGen = pPager->iDeltaGen;
-  pD->pgno = pPg->pgno;
-  pD->nRange = 0;
-  pD->nRangeAlloc = PAGER_PLOG_MAXRANGE;
-  pD->nByte = 0;
-  pD->isWhole = 0;
-  p->pNext = pPager->pDeltaList;
-  pPager->pDeltaList = p;
-  pPg->pPlogDelta = pD;
-  pagerPlogStat.nPage++;
-  return pD;
 }
 
 /*
@@ -3329,23 +3307,20 @@ static libsql_page_delta *pagerDeltaOf(Pager *pPager, PgHdr *pPg){
 ** Sticky: declared ranges are ignored for the rest of the transaction.
 */
 static void pagerDeltaWhole(Pager *pPager, PgHdr *pPg){
-  libsql_page_delta *pD;
   if( !pagerUseWal(pPager) || !pagerPlogEnabled() ) return;
-  pD = pagerDeltaOf(pPager, pPg);
-  if( pD==0 || pD->isWhole ) return;
-  pD->isWhole = 1;
-  pD->nRange = 0;
-  pD->nByte = 0;
+  pagerDeltaOpen(pPager, pPg);
+  if( pPg->plogWhole ) return;
+  pPg->plogWhole = 1;
+  pPg->plogNRange = 0;
   pagerPlogStat.nWhole++;
 }
 
 /*
 ** [iOff, iOff+nByte) of pPg was modified.  Ranges are kept sorted by offset
-** with none overlapping or touching, so the table holds the smallest
+** with none overlapping or touching, so the list holds the smallest
 ** description of what changed.  If it fills, the page falls back to whole.
 */
 static void pagerDeltaRange(Pager *pPager, PgHdr *pPg, int iOff, int nByte){
-  libsql_page_delta *pD;
   u16 *a;
   unsigned int iBeg, iEnd;
   int n, i, j;
@@ -3355,13 +3330,13 @@ static void pagerDeltaRange(Pager *pPager, PgHdr *pPg, int iOff, int nByte){
     pagerDeltaWhole(pPager, pPg);     /* cannot describe it: log it all */
     return;
   }
-  pD = pagerDeltaOf(pPager, pPg);
-  if( pD==0 || pD->isWhole ) return;
+  pagerDeltaOpen(pPager, pPg);
+  if( pPg->plogWhole ) return;
 
-  a = pD->aRange;
+  a = pPg->plogRange;
   iBeg = (unsigned int)iOff;
   iEnd = (unsigned int)(iOff + nByte);
-  n = pD->nRange;
+  n = pPg->plogNRange;
 
   /* Ranges before i end before this one starts and are left alone. */
   for(i=0; i<n && (unsigned int)a[2*i]+a[2*i+1] < iBeg; i++){}
@@ -3375,7 +3350,7 @@ static void pagerDeltaRange(Pager *pPager, PgHdr *pPg, int iOff, int nByte){
     a[2*i+1] = (u16)(iEnd - iBeg);
     if( j>i+1 ){
       memmove(&a[2*(i+1)], &a[2*j], (n-j)*2*sizeof(a[0]));
-      pD->nRange = (u16)(n - (j-i-1));
+      pPg->plogNRange = (u8)(n - (j-i-1));
     }
   }else if( n==PAGER_PLOG_MAXRANGE ){
     pagerPlogStat.nOverflow++;
@@ -3385,25 +3360,16 @@ static void pagerDeltaRange(Pager *pPager, PgHdr *pPg, int iOff, int nByte){
     memmove(&a[2*(i+1)], &a[2*i], (n-i)*2*sizeof(a[0]));
     a[2*i] = (u16)iBeg;
     a[2*i+1] = (u16)(iEnd - iBeg);
-    pD->nRange = (u16)(n+1);
+    pPg->plogNRange = (u8)(n+1);
   }
-  pD->nByte = 0;
-  for(i=0; i<pD->nRange; i++) pD->nByte += a[2*i+1];
 }
 
 /*
-** Release this transaction's deltas.  libsql_pghdr.pPlogDelta is deliberately
-** left pointing at freed memory: the page cache owns those headers and may
-** already have freed them, so they must not be touched here.  The generation
-** stamp in each delta is what makes the stale pointers detectable.
+** End of transaction.  Bumping the generation is all it takes: every page
+** still holding ranges from this transaction now reads as stale, and nothing
+** has to be found, walked or freed.
 */
 static void pagerDeltaClear(Pager *pPager){
-  PagerDelta *p, *pNext;
-  for(p=pPager->pDeltaList; p; p=pNext){
-    pNext = p->pNext;
-    sqlite3_free(p);
-  }
-  pPager->pDeltaList = 0;
   pPager->iDeltaGen++;
 }
 #endif /* SQLITE_OMIT_WAL */
@@ -3456,7 +3422,12 @@ static int pagerWalFrames(
   }
   pPager->aStat[PAGER_STAT_WRITE] += nList;
 
-  if( pList->pgno==1 ) pager_write_changecounter(pList);
+  if( pList->pgno==1 ){
+    pager_write_changecounter(pList);
+    /* That wrote into the page after the declarations for it were made, so
+    ** page 1 has to reach the log whole. */
+    pagerDeltaWhole(pPager, pList);
+  }
   rc = pPager->wal->methods.xFrames(pPager->wal->pData,
       pPager->pageSize, pList, nTruncate, isCommit, pPager->walSyncFlags, NULL
   );

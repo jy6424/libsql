@@ -22,9 +22,17 @@ struct libsql_pghdr {
   unsigned int pgno;             /* Page number for this page */
   unsigned int pageHash;         /* Hash of page content */
   unsigned short flags;          /* PGHDR flags defined below */
-  void *pPlogDelta;              /* libsql_page_delta*: what changed in this
-                                 ** page, filled in by pager.c for plog.c.
-                                 ** Null when not in use. */
+  /* What changed in this page, for physiological logging - see the PagerDelta
+  ** comment in pager.c.  Held inline rather than behind a pointer because a
+  ** page outlives the transaction that wrote it: anything allocated per
+  ** transaction and freed at its end would leave this header pointing at
+  ** released memory, and plogGen could not then be read to find that out.
+  ** plogNRange is meaningless unless plogGen is the pager's current
+  ** generation; plogWhole and an empty range list both mean the whole page. */
+  unsigned int plogGen;          /* Transaction these ranges describe */
+  unsigned char plogWhole;       /* Log the whole page, ignore the ranges */
+  unsigned char plogNRange;      /* Pairs in plogRange */
+  unsigned short plogRange[2*8]; /* {offset, length} pairs */
 
   /**********************************************************************
   ** Elements above, except pCache, are public.  All that follow are 

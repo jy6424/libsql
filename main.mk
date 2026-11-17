@@ -755,7 +755,9 @@ parse.c:	$(TOP)/src/parse.y lemon
 	cp $(TOP)/src/parse.y .
 	./lemon -s $(OPTS) parse.y
 
-sqlite3.h:	$(TOP)/src/sqlite.h.in $(TOP)/manifest mksourceid $(TOP)/VERSION $(TOP)/ext/rtree/sqlite3rtree.h
+# page_header.h and wal.h are copied into sqlite3.h by mksqlite3h.tcl - see
+# the note on the same rule in Makefile.in.
+sqlite3.h:	$(TOP)/src/sqlite.h.in $(TOP)/manifest mksourceid $(TOP)/VERSION $(TOP)/ext/rtree/sqlite3rtree.h $(TOP)/src/page_header.h $(TOP)/src/wal.h
 	tclsh $(TOP)/tool/mksqlite3h.tcl $(TOP) >sqlite3.h
 
 sqlite3rc.h:	$(TOP)/src/sqlite3.rc $(TOP)/VERSION

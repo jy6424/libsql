@@ -4286,7 +4286,6 @@ static int plogFrames(
 
   for(p=pList; p; p=p->pDirty){
     int nDbSize;                  /* 0 normally.  Positive == commit flag */
-    libsql_page_delta *pD = (libsql_page_delta*)p->pPlogDelta;
     u32 iPrev = 0;                /* This page's previous frame, if any */
     u16 nChain = 0;               /* Deltas this frame sits on top of */
     u16 nRange = 0;
@@ -4297,10 +4296,11 @@ static int plogFrames(
 
     /* Write only the bytes that changed, when the writer in btree.c declared
     ** them and this page's delta chain is still short enough that reading it
-    ** back stays cheap.  No delta, a delta for some other page, or one marked
-    ** whole all mean the full page goes in - see pager.c. */
-    if( pD!=0 && pD->pgno==p->pgno && !pD->isWhole
-     && pD->nRange>0 && pD->nRange<=PLOG_MAXRANGE ){
+    ** back stays cheap.  A page marked whole, or one with no ranges at all,
+    ** gets the full page - see pager.c.  Every page on this list went through
+    ** sqlite3PagerWrite() in the transaction being committed, so its ranges
+    ** cannot be left over from an earlier one. */
+    if( p->plogWhole==0 && p->plogNRange>0 && p->plogNRange<=PLOG_MAXRANGE ){
       u16 nChainPrev = 0;
       u8 ptPrev = PLOG_PT_FULL;
       plogWalFindFrame(pWal, p->pgno, &iPrev);
@@ -4321,19 +4321,19 @@ static int plogFrames(
     if( pt==PLOG_PT_RANGES ){
       /* body: the range table, then the bytes of each range in turn */
       int i, n = 0;
-      nRange = pD->nRange;
+      nRange = p->plogNRange;
       aBody = pWal->aPlogBody;
       for(i=0; i<nRange; i++){
-        u16 off = pD->aRange[2*i];
-        u16 len = pD->aRange[2*i+1];
+        u16 off = p->plogRange[2*i];
+        u16 len = p->plogRange[2*i+1];
         aBody[n++] = (u8)(off & 0xff);
         aBody[n++] = (u8)(off >> 8);
         aBody[n++] = (u8)(len & 0xff);
         aBody[n++] = (u8)(len >> 8);
       }
       for(i=0; i<nRange; i++){
-        u16 off = pD->aRange[2*i];
-        u16 len = pD->aRange[2*i+1];
+        u16 off = p->plogRange[2*i];
+        u16 len = p->plogRange[2*i+1];
         memcpy(&aBody[n], (u8*)p->pData + off, len);
         n += len;
       }
