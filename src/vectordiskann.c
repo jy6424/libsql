@@ -219,7 +219,6 @@ static void diskAnnStatInit(const DiskAnnIndex *pIndex){
 ** Off unless LIBSQL_PLOG is set.  Environment:
 **   LIBSQL_PLOG         enable
 **   LIBSQL_PLOG_BUDGET  bytes of pending operations to hold (default 512M)
-**   LIBSQL_PLOG_M       nodes merged per insert once over budget (default 2)
 */
 #include <stdio.h>
 #include <stdlib.h>
@@ -295,7 +294,6 @@ struct DiskAnnLog {
   int nChains;
   u64 nBytes;               /* memory held by pending operations */
   u64 nBudget;
-  int nMergeMax;
   u64 iRecRowid;            /* group currently being recorded */
   u8 *aRec;
   int nRec;
@@ -338,7 +336,6 @@ static DiskAnnChain *diskAnnChainFind(DiskAnnLog*, u64);
 static DiskAnnLog *diskAnnLogList = 0;
 static int diskAnnPlogState = 0;    /* 0 = not yet read, 1 = on, 2 = off */
 static u64 diskAnnPlogBudget = 0;
-static int diskAnnPlogM = 0;
 static int diskAnnPlogFlushSz = 0;  /* append buffer, the unit of a write() */
 static int diskAnnPlogSyncMode = 0;
 
@@ -353,10 +350,6 @@ static int diskAnnPlogEnabled(void){
       z = getenv("LIBSQL_PLOG_BUDGET");
       diskAnnPlogBudget = z ? strtoull(z, 0, 10) : (u64)4*1024*1024;
       if( diskAnnPlogBudget < (1<<20) ) diskAnnPlogBudget = (1<<20);
-      z = getenv("LIBSQL_PLOG_M");
-      diskAnnPlogM = z ? atoi(z) : 2;
-      if( diskAnnPlogM < 1 ) diskAnnPlogM = 1;
-      if( diskAnnPlogM > DISKANN_PLOG_NVICTIM ) diskAnnPlogM = DISKANN_PLOG_NVICTIM;
       /* 192K matches the die-level flush unit of the target device; a group
       ** never exceeds one frame, so the buffer only has to hold that */
       z = getenv("LIBSQL_PLOG_FLUSH");
@@ -652,7 +645,6 @@ static DiskAnnLog *diskAnnLogGet(const DiskAnnIndex *pIndex){
   }
   memset(p->apHash, 0, DISKANN_PLOG_NHASH * sizeof(DiskAnnChain*));
   p->nBudget = diskAnnPlogBudget;
-  p->nMergeMax = diskAnnPlogM;
   p->nBufAlloc = diskAnnPlogFlushSz;
   p->syncMode = diskAnnPlogSyncMode;
   p->pNext = diskAnnLogList;
@@ -1024,20 +1016,8 @@ static int diskAnnMergeSome(DiskAnnIndex *pIndex, int nMax){
   return rc;
 }
 
-/*
-** Merging writes blocks through the enclosing transaction.  If that is an
-** explicit one and it rolls back, the block writes are undone while the
-** chains we dropped are not - the operations would be gone for good.  So only
-** merge when the statement is its own transaction.
-*/
-static int diskAnnMergeIfNeeded(DiskAnnIndex *pIndex){
-  DiskAnnLog *p = pIndex->pLog;
-  if( p==0 || p->nBytes <= p->nBudget ) return SQLITE_OK;
-  if( !sqlite3_get_autocommit(pIndex->db) ) return SQLITE_OK;
-  return diskAnnMergeSome(pIndex, p->nMergeMax);
-}
-
-int diskAnnMergeAll(DiskAnnIndex *pIndex){
+/* Write out every node that has operations pending. */
+static int diskAnnMergeDrain(DiskAnnIndex *pIndex){
   DiskAnnLog *p = pIndex->pLog;
   int rc = SQLITE_OK;
   int nPrev;
@@ -1048,13 +1028,43 @@ int diskAnnMergeAll(DiskAnnIndex *pIndex){
     rc = diskAnnMergeSome(pIndex, DISKANN_PLOG_NVICTIM);
     if( p->nChains==nPrev ) break;   /* no progress; do not spin */
   }
+  /* emptying every chain is what lets the log file be reclaimed: truncation
+  ** needs nChains==0, so a partial drain would leave it growing forever */
   if( p->nChains==0 ) diskAnnLogTruncate(p);
+  return rc;
+}
+
+/*
+** Over budget, write everything back at once rather than trickling nodes out
+** a few at a time.  Holding the longest chains back would raise the number of
+** operations each block write absorbs, but that gain comes from deferral, not
+** from the record format - keeping the two apart is the point of the measure-
+** ment.  Draining fully also keeps the log file bounded.
+**
+** Merging writes blocks through the enclosing transaction.  If that is an
+** explicit one and it rolls back, the block writes are undone while the
+** chains we dropped are not - the operations would be gone for good.  So only
+** merge when the statement is its own transaction.
+*/
+static int diskAnnMergeIfNeeded(DiskAnnIndex *pIndex){
+  DiskAnnLog *p = pIndex->pLog;
+  if( p==0 || p->nBytes <= p->nBudget ) return SQLITE_OK;
+  if( !sqlite3_get_autocommit(pIndex->db) ) return SQLITE_OK;
+  return diskAnnMergeDrain(pIndex);
+}
+
+int diskAnnMergeAll(DiskAnnIndex *pIndex){
+  DiskAnnLog *p = pIndex->pLog;
+  int rc;
+
+  if( p==0 ) return SQLITE_OK;
+  rc = diskAnnMergeDrain(pIndex);
   /* the only place these numbers get out: the SQL wrapper's return value is
   ** discarded when the statement is run with sqlite3_exec() */
   fprintf(stderr,
     "plog: edge-updates=%llu  block-writes=%llu  ratio=%.2fx\n"
     "      log=%.1fMB in %llu writes, %llu fsyncs (buf=%dKB sync=%s%s)\n"
-    "      peak-mem=%.1fMB budget=%.0fMB M=%d chains-left=%d\n",
+    "      peak-mem=%.1fMB budget=%.0fMB chains-left=%d\n",
     (unsigned long long)p->nRecorded,
     (unsigned long long)p->nMerged,
     p->nMerged ? (double)p->nRecorded / (double)p->nMerged : 0.0,
@@ -1066,7 +1076,6 @@ int diskAnnMergeAll(DiskAnnIndex *pIndex){
     p->fd<0 ? ", MEMORY ONLY - no log file" : "",
     p->nBytesPeak / 1048576.0,
     p->nBudget / 1048576.0,
-    p->nMergeMax,
     p->nChains);
   return rc;
 }
