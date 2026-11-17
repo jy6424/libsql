@@ -351,7 +351,7 @@ static int diskAnnPlogEnabled(void){
     }else{
       diskAnnPlogState = 1;
       z = getenv("LIBSQL_PLOG_BUDGET");
-      diskAnnPlogBudget = z ? strtoull(z, 0, 10) : (u64)512*1024*1024;
+      diskAnnPlogBudget = z ? strtoull(z, 0, 10) : (u64)4*1024*1024;
       if( diskAnnPlogBudget < (1<<20) ) diskAnnPlogBudget = (1<<20);
       z = getenv("LIBSQL_PLOG_M");
       diskAnnPlogM = z ? atoi(z) : 2;
