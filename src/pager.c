@@ -615,6 +615,41 @@ struct PagerSavepoint {
 **   that with synchronous=NORMAL in WAL mode, transaction commit is not synced
 **   meaning that the 0x04 and 0x08 bits are both zero.
 */
+
+/*
+** Pre-images, for physiological logging (see plog.c).
+**
+** To log what changed inside a page rather than the whole page, something has
+** to know which bytes those are.  The pager does not: sqlite3PagerWrite()
+** marks a whole page dirty and the caller then modifies it in place.
+**
+** So keep a copy of the page as it was when it first became writeable in this
+** transaction.  At commit the copy and the current content are compared and
+** the differing ranges are what the log needs.  The alternative - having
+** callers declare the ranges they are about to touch - would mean changing
+** every writer, and would miss the b-tree entirely; a write of a whole 32KB
+** DiskANN block would still declare the whole block even though only an edge
+** slot inside it changed.  Diffing costs one page copy and one comparison per
+** dirty page, which is nothing next to the I/O it saves.
+**
+** One node per page dirtied, built in pager_write() and released when the
+** transaction ends.  The list is short - the pages one statement touches.
+*/
+typedef struct PagerPreImage PagerPreImage;
+struct PagerPreImage {
+  PagerPreImage *pNext;
+  PgHdr *pPg;                 /* The page this is a copy of */
+  Pgno pgno;                  /* pPg->pgno, kept so the page can be released */
+  u8 *aData;                  /* Content when the page became writeable */
+};
+#ifndef SQLITE_OMIT_WAL
+static void pagerPreImageClear(Pager*);
+#else
+# define pagerPreImageTake(A,B)
+# define pagerPreImageClear(A)
+# define pagerPreImageDiff(A,B)
+#endif
+
 struct Pager {
   sqlite3_vfs *pVfs;          /* OS functions to use for IO */
   u8 exclusiveMode;           /* Boolean. True if locking_mode==EXCLUSIVE */
@@ -704,6 +739,7 @@ struct Pager {
                                 We leave it temporarily to keep sqlite3_filename_wal working
                               */
 #endif
+  PagerPreImage *pPreList;    /* Pre-images for this transaction; see plog.c */
 };
 
 
@@ -2199,6 +2235,7 @@ static int pager_end_transaction(Pager *pPager, int hasSuper, int bCommit){
   }
   pPager->eState = PAGER_READER;
   pPager->setSuper = 0;
+  pagerPreImageClear(pPager);   /* pre-images only describe one transaction */
 
   return (rc==SQLITE_OK?rc2:rc);
 }
@@ -3199,6 +3236,148 @@ static int pagerRollbackWal(Pager *pPager){
   return rc;
 }
 
+#ifndef SQLITE_OMIT_WAL
+/*
+** Pre-image bookkeeping for physiological logging.  Stage 1 only measures:
+** the ranges are computed and counted but the log still writes whole pages,
+** so behaviour is unchanged and the numbers say whether the frame format is
+** worth changing.  If a page turns out to change in full there is nothing to
+** win and stage 2 should not be written.
+**
+** LIBSQL_PLOG      enable
+** LIBSQL_PLOG_GRAN comparison unit in bytes (default 64).  Byte-exact ranges
+**                  would be split finely enough that per-range headers cost
+**                  more than they save, so differences are rounded out to a
+**                  granule, the way SQLite/PPL rounds to a log sector.
+*/
+static int pagerPlogState = 0;        /* 0 unread, 1 on, 2 off */
+static int pagerPlogGran = 64;
+
+static struct PagerPlogStat {
+  u64 nPage;                  /* pages handed to the log */
+  u64 nPageByte;              /* what the log writes today: whole pages */
+  u64 nChangeByte;            /* what it would write: changed granules */
+  u64 nRange;                 /* contiguous changed runs, ie range headers */
+  u64 nNoPre;                 /* pages with no pre-image; counted as all new */
+} pagerPlogStat;
+
+static void pagerPlogReport(void){
+  struct PagerPlogStat *p = &pagerPlogStat;
+  u64 nFrame;
+  if( p->nPage==0 ) return;
+  /* 12 bytes per range: page number, offset, length */
+  nFrame = p->nChangeByte + p->nRange*12;
+  fprintf(stderr,
+    "plog-diff: pages=%llu  whole=%.1fMB  changed=%.1fMB  frames=%.1fMB"
+    "  saving=%.2fx\n"
+    "           ranges=%.2f/page  changed=%.2f%% of page  no-preimage=%llu\n",
+    (unsigned long long)p->nPage,
+    p->nPageByte/1048576.0,
+    p->nChangeByte/1048576.0,
+    nFrame/1048576.0,
+    nFrame ? (double)p->nPageByte/(double)nFrame : 0.0,
+    (double)p->nRange/(double)p->nPage,
+    p->nPageByte ? 100.0*p->nChangeByte/p->nPageByte : 0.0,
+    (unsigned long long)p->nNoPre);
+  fflush(stderr);
+}
+
+static int pagerPlogEnabled(void){
+  if( pagerPlogState==0 ){
+    const char *z = getenv("LIBSQL_PLOG");
+    if( z==0 || z[0]==0 || (z[0]=='0' && z[1]==0) ){
+      pagerPlogState = 2;
+    }else{
+      pagerPlogState = 1;
+      z = getenv("LIBSQL_PLOG_GRAN");
+      pagerPlogGran = z ? atoi(z) : 64;
+      if( pagerPlogGran < 1 ) pagerPlogGran = 1;
+      atexit(pagerPlogReport);
+    }
+  }
+  return pagerPlogState==1;
+}
+
+/*
+** Remember pPg's content before the caller modifies it.  Called from
+** pager_write() at the point the page becomes writeable, which happens once
+** per page per transaction, so no search for an existing entry is needed.
+*/
+static void pagerPreImageTake(Pager *pPager, PgHdr *pPg){
+  PagerPreImage *p;
+  if( !pagerUseWal(pPager) || !pagerPlogEnabled() ) return;
+  /* sqlite3PagerWrite() can reach pager_write() a second time for a page that
+  ** is already writeable but sits past the end of the file.  Keep the first
+  ** copy: that is the content the transaction started from. */
+  for(p=pPager->pPreList; p; p=p->pNext){
+    if( p->pPg==pPg && p->pgno==pPg->pgno ) return;
+  }
+  p = sqlite3_malloc(sizeof(*p) + pPager->pageSize);
+  if( p==0 ) return;          /* measurement only; losing one is harmless */
+  p->aData = (u8*)&p[1];
+  p->pPg = pPg;
+  p->pgno = pPg->pgno;
+  memcpy(p->aData, pPg->pData, pPager->pageSize);
+  p->pNext = pPager->pPreList;
+  pPager->pPreList = p;
+}
+
+static void pagerPreImageClear(Pager *pPager){
+  PagerPreImage *p, *pNext;
+  for(p=pPager->pPreList; p; p=pNext){
+    pNext = p->pNext;
+    sqlite3_free(p);
+  }
+  pPager->pPreList = 0;
+}
+
+/*
+** Compare each page about to be logged against its pre-image and count what
+** a delta frame would have cost.  The pre-image is then refreshed, so that a
+** page written twice in one transaction - a cache spill followed by the
+** commit - is measured against what the log already holds rather than
+** against the start of the transaction.
+*/
+static void pagerPreImageDiff(Pager *pPager, PgHdr *pList){
+  struct PagerPlogStat *pStat = &pagerPlogStat;
+  int nGran = pagerPlogGran;
+  int szPage = pPager->pageSize;
+  PgHdr *pPg;
+  PagerPreImage *p;
+
+  for(pPg=pList; pPg; pPg=pPg->pDirty){
+    const u8 *aNew = (const u8*)pPg->pData;
+    u8 *aOld = 0;
+    int i, inRun = 0;
+
+    pStat->nPage++;
+    pStat->nPageByte += (u64)szPage;
+    /* pgno as well as the pointer: a PgHdr freed and reused mid-transaction
+    ** would otherwise match the wrong page */
+    for(p=pPager->pPreList; p; p=p->pNext){
+      if( p->pPg==pPg && p->pgno==pPg->pgno ){ aOld = p->aData; break; }
+    }
+    if( aOld==0 ){
+      /* never became writeable through pager_write(), or the copy failed */
+      pStat->nNoPre++;
+      pStat->nChangeByte += (u64)szPage;
+      pStat->nRange++;
+      continue;
+    }
+    for(i=0; i<szPage; i+=nGran){
+      int n = (szPage - i < nGran) ? szPage - i : nGran;
+      if( memcmp(aOld + i, aNew + i, n)!=0 ){
+        pStat->nChangeByte += (u64)n;
+        if( !inRun ){ pStat->nRange++; inRun = 1; }
+      }else{
+        inRun = 0;
+      }
+    }
+    memcpy(aOld, aNew, szPage);
+  }
+}
+#endif /* SQLITE_OMIT_WAL */
+
 /*
 ** This function is a wrapper around pPager->pWalMethods->xFrames(). As well as logging
 ** the contents of the list of pages headed by pList (connected by pDirty),
@@ -3248,6 +3427,7 @@ static int pagerWalFrames(
   pPager->aStat[PAGER_STAT_WRITE] += nList;
 
   if( pList->pgno==1 ) pager_write_changecounter(pList);
+  if( pPager->pPreList ) pagerPreImageDiff(pPager, pList);
   rc = pPager->wal->methods.xFrames(pPager->wal->pData,
       pPager->pageSize, pList, nTruncate, isCommit, pPager->walSyncFlags, NULL
   );
@@ -4249,6 +4429,7 @@ int sqlite3PagerClose(Pager *pPager, sqlite3 *db){
   sqlite3OsClose(pPager->jfd);
   sqlite3OsClose(pPager->fd);
   sqlite3PageFree(pTmp);
+  pagerPreImageClear(pPager);
   sqlite3PcacheClose(pPager->pPCache);
   assert( !pPager->aSavepoint && !pPager->pInJournal );
   assert( !isOpen(pPager->jfd) && !isOpen(pPager->sjfd) );
@@ -6149,6 +6330,7 @@ static int pager_write(PgHdr *pPg){
   ** after the page has been successfully journalled, before setting the
   ** PGHDR_WRITEABLE bit that indicates that the page can be safely modified.
   */
+  pagerPreImageTake(pPager, pPg);   /* content is still unmodified here */
   pPg->flags |= PGHDR_WRITEABLE;
  
   /* If the statement journal is open and the page is not in it,
