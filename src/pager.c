@@ -647,7 +647,7 @@ static void pagerPreImageClear(Pager*);
 #else
 # define pagerPreImageTake(A,B)
 # define pagerPreImageClear(A)
-# define pagerPreImageDiff(A,B)
+# define pagerPreImageDiff(A,B,C)
 #endif
 
 struct Pager {
@@ -3338,7 +3338,7 @@ static void pagerPreImageClear(Pager *pPager){
 ** commit - is measured against what the log already holds rather than
 ** against the start of the transaction.
 */
-static void pagerPreImageDiff(Pager *pPager, PgHdr *pList){
+static void pagerPreImageDiff(Pager *pPager, PgHdr *pList, int isCommit){
   struct PagerPlogStat *pStat = &pagerPlogStat;
   int nGran = pagerPlogGran;
   int szPage = pPager->pageSize;
@@ -3364,6 +3364,10 @@ static void pagerPreImageDiff(Pager *pPager, PgHdr *pList){
       pStat->nRange++;
       continue;
     }
+    /* Most pages that reach the log are not changed at all: writing a whole
+    ** DiskANN block dirties every page it spans while one edge slot inside it
+    ** moved.  One comparison settles those, and they cost no frame. */
+    if( memcmp(aOld, aNew, szPage)==0 ) continue;
     for(i=0; i<szPage; i+=nGran){
       int n = (szPage - i < nGran) ? szPage - i : nGran;
       if( memcmp(aOld + i, aNew + i, n)!=0 ){
@@ -3373,7 +3377,10 @@ static void pagerPreImageDiff(Pager *pPager, PgHdr *pList){
         inRun = 0;
       }
     }
-    memcpy(aOld, aNew, szPage);
+    /* A commit releases the pre-images straight after this, so only a spill -
+    ** where the page stays live and may be logged again - needs the baseline
+    ** moved forward to what the log now holds. */
+    if( !isCommit ) memcpy(aOld, aNew, szPage);
   }
 }
 #endif /* SQLITE_OMIT_WAL */
@@ -3427,7 +3434,7 @@ static int pagerWalFrames(
   pPager->aStat[PAGER_STAT_WRITE] += nList;
 
   if( pList->pgno==1 ) pager_write_changecounter(pList);
-  if( pPager->pPreList ) pagerPreImageDiff(pPager, pList);
+  if( pPager->pPreList ) pagerPreImageDiff(pPager, pList, isCommit);
   rc = pPager->wal->methods.xFrames(pPager->wal->pData,
       pPager->pageSize, pList, nTruncate, isCommit, pPager->walSyncFlags, NULL
   );
