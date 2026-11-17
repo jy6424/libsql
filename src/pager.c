@@ -638,7 +638,8 @@ struct PagerSavepoint {
 typedef struct PagerPreImage PagerPreImage;
 struct PagerPreImage {
   PagerPreImage *pNext;
-  PgHdr *pPg;                 /* The page this is a copy of */
+  PgHdr *pPg;                 /* Identity only - never dereferenced, the page
+                              ** cache may have freed it */
   Pgno pgno;                  /* pPg->pgno, kept so the page can be released */
   u8 *aData;                  /* Content when the page became writeable */
   libsql_page_delta *pDelta;  /* What the comparison found, for plog.c */
@@ -3345,7 +3346,11 @@ static void pagerPreImageClear(Pager *pPager){
   PagerPreImage *p, *pNext;
   for(p=pPager->pPreList; p; p=pNext){
     pNext = p->pNext;
-    if( p->pPg ) p->pPg->pPlogDelta = 0;
+    /* Do not touch p->pPg: the page cache owns that memory and may already
+    ** have freed it.  The pointer is only ever compared, never followed.
+    ** Nothing has to clear libsql_pghdr.pPlogDelta either - every page handed
+    ** to the log passes through pagerPreImageDiff(), which assigns it, and
+    ** plog.c ignores a delta whose pgno does not match the page. */
     sqlite3_free(p->pDelta);
     sqlite3_free(p);
   }
