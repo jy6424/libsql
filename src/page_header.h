@@ -22,6 +22,9 @@ struct libsql_pghdr {
   unsigned int pgno;             /* Page number for this page */
   unsigned int pageHash;         /* Hash of page content */
   unsigned short flags;          /* PGHDR flags defined below */
+  void *pPlogDelta;              /* libsql_page_delta*: what changed in this
+                                 ** page, filled in by pager.c for plog.c.
+                                 ** Null when not in use. */
 
   /**********************************************************************
   ** Elements above, except pCache, are public.  All that follow are 

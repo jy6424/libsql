@@ -3971,6 +3971,8 @@ static int plogFrames(
   u32 iFrame;                     /* Next frame address */
   PgHdr *p;                       /* Iterator to run through pList with. */
   int szFrame;                    /* Header plus a whole page */
+  PgHdr *pCommit = 0;             /* Page that carries the commit mark */
+  int nSkip = 0;                  /* Pages left out because nothing changed */
   i64 iOffset;                    /* Next byte to write in WAL file */
   PlogWriter w;                    /* The writer */
   WalIndexHdr *pLive;             /* Pointer to shared header */
@@ -4068,11 +4070,38 @@ static int plogFrames(
   ** dead bytes when a page is spilled and then committed, and the checksum
   ** rewrite that in-place overwriting needs is no longer reachable.
   */
+  /* Which page carries the commit mark.  wal.c always puts it on the last
+  ** page of the list, but that page may have nothing to log and be skipped
+  ** below, and then recovery would find no commit.  Hand the mark to the last
+  ** page that does get a frame; if nothing does, keep the last page so there
+  ** is somewhere to put it. */
+  if( isCommit ){
+    PgHdr *pMark = 0;
+    for(p=pList; p; p=p->pDirty){
+      libsql_page_delta *pD = (libsql_page_delta*)p->pPlogDelta;
+      if( pD==0 || pD->pgno!=p->pgno || pD->nRange>0 ) pMark = p;
+      pCommit = p;
+    }
+    if( pMark ) pCommit = pMark;
+  }
+
   for(p=pList; p; p=p->pDirty){
     int nDbSize;   /* 0 normally.  Positive == commit flag */
     u32 nFrame = (u32)szFrame;
+    libsql_page_delta *pD = (libsql_page_delta*)p->pPlogDelta;
 
-    nDbSize = (isCommit && p->pDirty==0) ? nTruncate : 0;
+    /* A page the transaction left byte for byte as it was needs no frame: the
+    ** copy already in the log or the database file is the right content, and
+    ** leaving it out of the index means readers keep finding that copy.  This
+    ** is where most of the saving is - three quarters of the pages handed to
+    ** the log by a DiskANN block write are in this state. */
+    if( pD!=0 && pD->pgno==p->pgno && pD->nRange==0 && p!=pCommit ){
+      p->flags &= ~PGHDR_WAL_APPEND;
+      nSkip++;
+      continue;
+    }
+
+    nDbSize = (isCommit && p==pCommit) ? nTruncate : 0;
     if( nDbSize && WAL_SYNC_FLAGS(sync_flags)!=0 && pWal->padToSectorBoundary ){
       /* Pad out to the next sector boundary by declaring a longer last frame.
       ** wal.c repeats the final frame instead, which cannot land on the
@@ -4137,6 +4166,7 @@ static int plogFrames(
     iFrame++;
     rc = plogIndexAppend(pWal, iFrame, p->pgno);
   }
+  UNUSED_PARAMETER(nSkip);
   /* wal.c indexes the extra copies of the last frame it wrote for padding.
   ** Padding is absorbed into the last frame's own length here, so there are
   ** no extra frames to index. */

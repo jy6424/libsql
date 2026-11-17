@@ -641,7 +641,14 @@ struct PagerPreImage {
   PgHdr *pPg;                 /* The page this is a copy of */
   Pgno pgno;                  /* pPg->pgno, kept so the page can be released */
   u8 *aData;                  /* Content when the page became writeable */
+  libsql_page_delta *pDelta;  /* What the comparison found, for plog.c */
 };
+
+/* Ranges one page is allowed to report.  Measured at 1.11 per changed page,
+** so this is never reached in practice; a page that somehow fragments more
+** than this reports one range spanning the whole of the changed region, which
+** is correct, just larger than it needs to be. */
+#define PAGER_PLOG_MAXRANGE 32
 #ifndef SQLITE_OMIT_WAL
 static void pagerPreImageClear(Pager*);
 #else
@@ -3270,8 +3277,10 @@ static void pagerPlogReport(void){
   nChanged = p->nPage - p->nPageSame;
   /* average page size; the only sizes in play are powers of two */
   nSzPage = (double)p->nPageByte / (double)p->nPage;
-  /* 12 bytes per range: page number, offset, length */
-  nFrame = p->nChangeByte + p->nRange*12;
+  /* What plog.c actually writes: a 32 byte frame header per changed page, a
+  ** 4 byte descriptor per range, and the changed bytes.  Pages that did not
+  ** change cost nothing - they get no frame at all. */
+  nFrame = p->nChangeByte + nChanged*32 + p->nRange*4;
   fprintf(stderr,
     "plog-diff: pages=%llu  whole=%.1fMB  changed=%.1fMB  frames=%.1fMB"
     "  saving=%.2fx\n"
@@ -3318,6 +3327,7 @@ static void pagerPreImageTake(Pager *pPager, PgHdr *pPg){
   /* sqlite3PagerWrite() can reach pager_write() a second time for a page that
   ** is already writeable but sits past the end of the file.  Keep the first
   ** copy: that is the content the transaction started from. */
+  if( pPg->pgno>pPager->dbOrigSize ) return;   /* new page: all of it is new */
   for(p=pPager->pPreList; p; p=p->pNext){
     if( p->pPg==pPg && p->pgno==pPg->pgno ) return;
   }
@@ -3335,6 +3345,8 @@ static void pagerPreImageClear(Pager *pPager){
   PagerPreImage *p, *pNext;
   for(p=pPager->pPreList; p; p=pNext){
     pNext = p->pNext;
+    if( p->pPg ) p->pPg->pPlogDelta = 0;
+    sqlite3_free(p->pDelta);
     sqlite3_free(p);
   }
   pPager->pPreList = 0;
@@ -3367,24 +3379,59 @@ static void pagerPreImageDiff(Pager *pPager, PgHdr *pList, int isCommit){
       if( p->pPg==pPg && p->pgno==pPg->pgno ){ aOld = p->aData; break; }
     }
     if( aOld==0 ){
-      /* never became writeable through pager_write(), or the copy failed */
+      /* never became writeable through pager_write(), or the copy failed, or
+      ** the page is new: log all of it */
       pStat->nNoPre++;
       pStat->nChangeByte += (u64)szPage;
       pStat->nRange++;
+      pPg->pPlogDelta = 0;
       continue;
     }
+    if( p->pDelta==0 ){
+      p->pDelta = sqlite3_malloc(sizeof(libsql_page_delta)
+                                 + 2*PAGER_PLOG_MAXRANGE*sizeof(u16));
+      if( p->pDelta==0 ){
+        pStat->nNoPre++;
+        pStat->nChangeByte += (u64)szPage;
+        pStat->nRange++;
+        pPg->pPlogDelta = 0;
+        continue;
+      }
+      p->pDelta->nRangeAlloc = PAGER_PLOG_MAXRANGE;
+    }
+    p->pDelta->pgno = pPg->pgno;
+    p->pDelta->nRange = 0;
+    p->pDelta->nByte = 0;
+    pPg->pPlogDelta = p->pDelta;
     /* Most pages that reach the log are not changed at all: writing a whole
     ** DiskANN block dirties every page it spans while one edge slot inside it
     ** moved.  One comparison settles those, and they cost no frame. */
     if( memcmp(aOld, aNew, szPage)==0 ){
       pStat->nPageSame++;
-      continue;
+      continue;                 /* pDelta->nRange stays 0: nothing to log */
     }
     for(i=0; i<szPage; i+=nGran){
       int n = (szPage - i < nGran) ? szPage - i : nGran;
       if( memcmp(aOld + i, aNew + i, n)!=0 ){
+        libsql_page_delta *pD = p->pDelta;
         pStat->nChangeByte += (u64)n;
-        if( !inRun ){ pStat->nRange++; inRun = 1; }
+        if( !inRun ){
+          pStat->nRange++;
+          inRun = 1;
+          if( pD->nRange<pD->nRangeAlloc ){
+            pD->aRange[2*pD->nRange] = (u16)i;
+            pD->aRange[2*pD->nRange+1] = (u16)n;
+            pD->nRange++;
+          }else{
+            /* out of room: widen the last range to cover up to here */
+            int iLast = 2*(pD->nRange-1);
+            pD->aRange[iLast+1] = (u16)(i + n - pD->aRange[iLast]);
+          }
+        }else{
+          int iLast = 2*(pD->nRange-1);
+          pD->aRange[iLast+1] = (u16)(pD->aRange[iLast+1] + n);
+        }
+        pD->nByte += (u32)n;
       }else{
         inRun = 0;
       }
@@ -3446,7 +3493,7 @@ static int pagerWalFrames(
   pPager->aStat[PAGER_STAT_WRITE] += nList;
 
   if( pList->pgno==1 ) pager_write_changecounter(pList);
-  if( pPager->pPreList ) pagerPreImageDiff(pPager, pList, isCommit);
+  if( pagerPlogEnabled() ) pagerPreImageDiff(pPager, pList, isCommit);
   rc = pPager->wal->methods.xFrames(pPager->wal->pData,
       pPager->pageSize, pList, nTruncate, isCommit, pPager->walSyncFlags, NULL
   );

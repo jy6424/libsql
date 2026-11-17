@@ -146,6 +146,29 @@ typedef struct libsql_wal_methods {
 } libsql_wal_methods;
 
 
+/*
+** What a transaction changed inside one page, handed from pager.c to plog.c
+** through libsql_pghdr.pPlogDelta.
+**
+** nRange==0 says the page is byte for byte what it already was.  Writing a
+** whole block of a DiskANN node dirties every page it spans while only a few
+** hundred bytes inside it moved, so most pages reaching the log are in that
+** state and need no frame at all.
+**
+** aRange holds nRange pairs: a byte offset into the page and a length.  The
+** pairs are in increasing offset order and do not overlap.
+*/
+typedef struct libsql_page_delta libsql_page_delta;
+struct libsql_page_delta {
+  unsigned int pgno;                  /* Page this describes; guards against a
+                                      ** recycled libsql_pghdr still pointing
+                                      ** at an earlier page's delta */
+  unsigned short nRange;              /* Pairs in aRange; 0 = unchanged */
+  unsigned short nRangeAlloc;         /* Pairs aRange has room for */
+  unsigned int nByte;                 /* Total of the lengths in aRange */
+  unsigned short aRange[2];           /* {offset, length} pairs */
+};
+
 /* Object declarations */
 typedef struct WalIndexHdr WalIndexHdr;
 typedef struct WalIterator WalIterator;
