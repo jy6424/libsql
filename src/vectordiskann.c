@@ -218,7 +218,8 @@ static void diskAnnStatInit(const DiskAnnIndex *pIndex){
 **
 ** Off unless LIBSQL_PLOG is set.  Environment:
 **   LIBSQL_PLOG         enable
-**   LIBSQL_PLOG_BUDGET  bytes of pending operations to hold (default 512M)
+**   LIBSQL_PLOG_BUDGET  bytes of pending operations to hold (default 4096000,
+**                       matching wal_autocheckpoint x page size)
 */
 #include <stdio.h>
 #include <stdlib.h>
@@ -347,8 +348,11 @@ static int diskAnnPlogEnabled(void){
       diskAnnPlogState = 2;
     }else{
       diskAnnPlogState = 1;
+      /* 1000 pages x 4096 B: the wal_autocheckpoint threshold this is measured
+      ** against, so both modes hold back the same amount before writing out */
       z = getenv("LIBSQL_PLOG_BUDGET");
-      diskAnnPlogBudget = z ? strtoull(z, 0, 10) : (u64)4*1024*1024;
+      diskAnnPlogBudget = z ? strtoull(z, 0, 10) :
+        (u64)SQLITE_DEFAULT_WAL_AUTOCHECKPOINT * SQLITE_DEFAULT_PAGE_SIZE;
       if( diskAnnPlogBudget < (1<<20) ) diskAnnPlogBudget = (1<<20);
       /* 192K matches the die-level flush unit of the target device; a group
       ** never exceeds one frame, so the buffer only has to hold that */
