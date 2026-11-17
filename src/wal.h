@@ -261,6 +261,7 @@ typedef struct sqlite3_wal {
   long long *aFrameOff;               /* aFrameOff[i-1] = offset of frame i */
   unsigned int nFrameOff;             /* Frames whose offset is known */
   unsigned int nFrameOffAlloc;        /* Allocated entries in aFrameOff */
+  unsigned char *aPlogBody;           /* Scratch for assembling a frame body */
 } sqlite3_wal;
 
 struct libsql_wal {

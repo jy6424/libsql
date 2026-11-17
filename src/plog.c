@@ -515,16 +515,76 @@ struct PlogCkptInfo {
 **   [28..29] u16 nRange       number of {offset,length} pairs in the body
 **   [30]     u8  payloadType  PLOG_PT_*
 **   [31]     u8  unused
+**   [32..35] u32 iPrev        previous frame for this page in this log cycle,
+**                             or 0 when this is the page's first one
+**   [36..37] u16 nChain       deltas on top of the base, this one included
+**   [38..39] u16 unused
 **
-** The checksum covers bytes 0..7 and 24..nFrame, so every checksummed run
-** stays a multiple of 8 as plogChecksumBytes() requires.
+** The checksum covers bytes 0..7, then 24..40, then the whole body, so every
+** checksummed run stays a multiple of 8 as plogChecksumBytes() requires.
+** The body is always nFrame-40 bytes: padding written to reach a sector
+** boundary is part of it and is checksummed with it.
+**
+** A PLOG_PT_RANGES frame carries only the bytes of the page that changed.
+** They apply on top of a base: the page in the database file when iPrev is
+** 0, otherwise the content reconstructed from frame iPrev.
+**
+** Taking the database file as the base is what makes the saving possible.
+** Requiring a whole page in the log before any delta would cost one full
+** image per page per log cycle, and this workload rewrites a given page
+** about once per cycle, so nothing would be left to save.  The price is that
+** a checkpoint has to run to completion and reset the log before another
+** connection reads the database - true for a single connection, not in
+** general.
 */
-#define PLOG_FRAME_HDRSIZE 32
+#define PLOG_FRAME_HDRSIZE 40
+
+/*
+** What this implementation actually wrote.  The prediction in pager.c is
+** computed from the comparison; these are the bytes that reached the file.
+*/
+static struct PlogWriteStat {
+  u64 nFrame;                 /* Frames appended */
+  u64 nByte;                  /* Bytes of those frames, padding included */
+  u64 nCommit;                /* Frame sets completing a transaction */
+  /* Writing only the bytes that changed needs a full image of the page to
+  ** apply them to, and that image has to live in the log: the database file
+  ** cannot serve as the base, because a checkpoint overwrites it and the
+  ** delta would then be applied twice.  So a page's first frame in each log
+  ** cycle is necessarily a whole page, and only later frames for the same
+  ** page can be deltas.  These two counters say how often that happens -
+  ** they decide whether a delta format can pay for itself here. */
+  u64 nRepeat;                /* Frames for a page already in the log */
+  u64 nDelta;                 /* Frames that carried ranges, not a page */
+  int isInit;
+} plogWriteStat;
+
+static void plogWriteReport(void){
+  struct PlogWriteStat *p = &plogWriteStat;
+  if( p->nFrame==0 ) return;
+  fprintf(stderr,
+    "plog-wrote: frames=%llu (%.1fMB)  %.0fB/frame  commits=%llu\n"
+    "            delta=%llu (%.1f%%)  whole-page=%llu  repeat-in-cycle=%llu\n",
+    (unsigned long long)p->nFrame, p->nByte/1048576.0,
+    (double)p->nByte/(double)p->nFrame,
+    (unsigned long long)p->nCommit,
+    (unsigned long long)p->nDelta, 100.0*p->nDelta/(double)p->nFrame,
+    (unsigned long long)(p->nFrame - p->nDelta),
+    (unsigned long long)p->nRepeat);
+  fflush(stderr);
+}
 
 /* Values for the payloadType byte. */
 #define PLOG_PT_FULL   0    /* body is the whole page, as wal.c writes it */
 #define PLOG_PT_RANGES 1    /* body is nRange x {u16 off, u16 len} then bytes */
-#define PLOG_PT_PAD    2    /* filler to reach a sector boundary; not a page */
+
+/* Deltas allowed to pile up on one page before a whole page is written
+** again.  Reading the page costs one frame header read per link, so this is
+** what bounds read amplification. */
+#define PLOG_MAXCHAIN  16
+
+/* Ranges one frame can carry; at least PAGER_PLOG_MAXRANGE in pager.c. */
+#define PLOG_MAXRANGE  32
 
 /* Size of write ahead log header, including checksum. */
 #define PLOG_HDRSIZE 32
@@ -555,6 +615,7 @@ struct PlogCkptInfo {
 static i64 plogFrameOffset(Wal *pWal, u32 iFrame);
 static int plogFrameRecord(Wal *pWal, u32 iFrame, i64 iOff);
 static void plogFrameForget(Wal *pWal, u32 nKeep);
+static int plogReadPageContent(Wal*, u32 iRead, int szPage, u8 *pOut);
 
 /*
 ** Candidate values for Wal.exclusiveMode.
@@ -949,16 +1010,19 @@ static void plogEncodeFrame(
   u32 nFrame,                     /* Total frame length, a multiple of 8 */
   u16 nRange,                     /* Ranges in the body (0 unless PT_RANGES) */
   u8 payloadType,                 /* PLOG_PT_* */
+  u32 iPrev,                      /* Previous frame for this page, or 0 */
+  u16 nChain,                     /* Deltas on top of the base */
   u8 *aBody,                      /* Body to be checksummed, or 0 */
   int nBody,                      /* Bytes of aBody; a multiple of 8 */
+  int nPad,                       /* Zero bytes after it; a multiple of 8 */
   u8 *aFrame                      /* OUT: Write encoded frame header here */
 ){
   int nativeCksum;                /* True for native byte-order checksums */
   u32 *aCksum = pWal->hdr.aFrameCksum;
-  assert( PLOG_FRAME_HDRSIZE==32 );
+  assert( PLOG_FRAME_HDRSIZE==40 );
   assert( nFrame>=PLOG_FRAME_HDRSIZE && (nFrame & 7)==0 );
-  assert( (nBody & 7)==0 );
-  assert( (u32)(PLOG_FRAME_HDRSIZE+nBody)<=nFrame );
+  assert( (nBody & 7)==0 && (nPad & 7)==0 );
+  assert( (u32)(PLOG_FRAME_HDRSIZE+nBody+nPad)==nFrame );
   sqlite3Put4byte(&aFrame[0], iPage);
   sqlite3Put4byte(&aFrame[4], nTruncate);
   sqlite3Put4byte(&aFrame[24], nFrame);
@@ -966,16 +1030,29 @@ static void plogEncodeFrame(
   aFrame[29] = (u8)(nRange >> 8);
   aFrame[30] = payloadType;
   aFrame[31] = 0;
+  sqlite3Put4byte(&aFrame[32], iPrev);
+  aFrame[36] = (u8)(nChain & 0xff);
+  aFrame[37] = (u8)(nChain >> 8);
+  aFrame[38] = 0;
+  aFrame[39] = 0;
   memcpy(&aFrame[8], pWal->hdr.aSalt, 8);
 
-  /* Both checksummed runs are multiples of 8, which plogChecksumBytes needs.
-  ** Anything between the body and nFrame is slack - padding written to reach
-  ** a sector boundary - and is neither checksummed nor read back. */
   nativeCksum = (pWal->hdr.bigEndCksum==SQLITE_BIGENDIAN);
   plogChecksumBytes(nativeCksum, aFrame, 8, aCksum, aCksum);
-  plogChecksumBytes(nativeCksum, &aFrame[24], 8, aCksum, aCksum);
+  plogChecksumBytes(nativeCksum, &aFrame[24], 16, aCksum, aCksum);
   if( nBody>0 ){
     plogChecksumBytes(nativeCksum, aBody, nBody, aCksum, aCksum);
+  }
+  if( nPad>0 ){
+    /* padding counts as body, so it is checksummed with it */
+    u8 aZero[64];
+    int n = nPad;
+    memset(aZero, 0, sizeof(aZero));
+    while( n>0 ){
+      int k = n>(int)sizeof(aZero) ? (int)sizeof(aZero) : n;
+      plogChecksumBytes(nativeCksum, aZero, k, aCksum, aCksum);
+      n -= k;
+    }
   }
 
   sqlite3Put4byte(&aFrame[16], aCksum[0]);
@@ -994,7 +1071,9 @@ static int plogDecodeFrame(
   u32 *pnFrame,                   /* OUT: Total length of this frame */
   u16 *pnRange,                   /* OUT: Range count from the header */
   u8 *pPayloadType,               /* OUT: PLOG_PT_* */
-  u8 *aData,                      /* Body of the frame (for checksum) */
+  u32 *piPrev,                    /* OUT: Previous frame for this page */
+  u16 *pnChain,                   /* OUT: Deltas on top of the base */
+  u8 *aData,                      /* Body of the frame, nFrame-40 bytes */
   int nData,                      /* Bytes of aData; a multiple of 8 */
   u8 *aFrame                      /* Frame data */
 ){
@@ -1002,7 +1081,7 @@ static int plogDecodeFrame(
   u32 *aCksum = pWal->hdr.aFrameCksum;
   u32 pgno;                       /* Page number of the frame */
   u32 nFrame;                     /* Declared length of the frame */
-  assert( PLOG_FRAME_HDRSIZE==32 );
+  assert( PLOG_FRAME_HDRSIZE==40 );
 
   /* A frame is only valid if it declares a sane length: the walk through the
   ** log depends on it, so a bad one has to stop recovery here. */
@@ -1032,7 +1111,7 @@ static int plogDecodeFrame(
   */
   nativeCksum = (pWal->hdr.bigEndCksum==SQLITE_BIGENDIAN);
   plogChecksumBytes(nativeCksum, aFrame, 8, aCksum, aCksum);
-  plogChecksumBytes(nativeCksum, &aFrame[24], 8, aCksum, aCksum);
+  plogChecksumBytes(nativeCksum, &aFrame[24], 16, aCksum, aCksum);
   if( nData>0 ){
     plogChecksumBytes(nativeCksum, aData, nData, aCksum, aCksum);
   }
@@ -1051,6 +1130,8 @@ static int plogDecodeFrame(
   *pnFrame = nFrame;
   *pnRange = (u16)(aFrame[28] | (aFrame[29]<<8));
   *pPayloadType = aFrame[30];
+  *piPrev = sqlite3Get4byte(&aFrame[32]);
+  *pnChain = (u16)(aFrame[36] | (aFrame[37]<<8));
   return 1;
 }
 
@@ -1470,7 +1551,9 @@ static int plogIndexRecover(Wal *pWal){
     }
 
     /* Malloc a buffer to read frames into. */
-    szFrame = szPage + PLOG_FRAME_HDRSIZE;
+    /* room for a whole page, the padding a commit frame may carry out to a
+    ** sector boundary, and the private hash page that follows */
+    szFrame = szPage + PLOG_FRAME_HDRSIZE + 65536;
     aFrame = (u8 *)sqlite3_malloc64(szFrame + PLOGINDEX_PGSZ);
     PLOG_SEH_FREE_ON_ERROR(0, aFrame);
     if( !aFrame ){
@@ -1521,14 +1604,29 @@ static int plogIndexRecover(Wal *pWal){
         u16 nRange;               /* Range count from the frame header */
         u8 payloadType;           /* PLOG_PT_* of this frame */
 
-        /* Read and decode the next log frame. */
+        /* Read and decode the next log frame.  The header states the frame's
+        ** length, and the body is all of the rest of it: a whole page, or a
+        ** range table and the bytes it describes, in either case followed by
+        ** any padding, all of which the checksum covers. */
+        u32 iPrev;                /* Previous frame for this page */
+        u16 nChain;               /* Deltas on top of the base */
+        int nBody;
         if( iOffset<0 ) break;
-        rc = sqlite3OsRead(pWal->pWalFd, aFrame, szFrame, iOffset);
+        rc = sqlite3OsRead(pWal->pWalFd, aFrame, PLOG_FRAME_HDRSIZE, iOffset);
         if( rc!=SQLITE_OK ) break;
+        nFrameLen = sqlite3Get4byte(&aFrame[24]);
+        if( nFrameLen<PLOG_FRAME_HDRSIZE || (nFrameLen & 7)!=0 ) break;
+        nBody = (int)nFrameLen - PLOG_FRAME_HDRSIZE;
+        if( nBody>szFrame-PLOG_FRAME_HDRSIZE ) break;
+        if( nBody>0 ){
+          rc = sqlite3OsRead(pWal->pWalFd, aData, nBody,
+                             iOffset+PLOG_FRAME_HDRSIZE);
+          if( rc!=SQLITE_OK ) break;
+        }
         isValid = plogDecodeFrame(pWal, &pgno, &nTruncate, &nFrameLen,
-                                  &nRange, &payloadType, aData, szPage, aFrame);
+                                  &nRange, &payloadType, &iPrev, &nChain,
+                                  aData, nBody, aFrame);
         if( !isValid ) break;
-        if( payloadType!=PLOG_PT_FULL ) break;
         rc = plogIndexAppend(pWal, iFrame, pgno);
         if( NEVER(rc!=SQLITE_OK) ) break;
 
@@ -1637,6 +1735,8 @@ recovery_error:
 ** Close an open wal-index.
 */
 static void plogIndexClose(Wal *pWal, int isDelete){
+  sqlite3_free(pWal->aPlogBody);
+  pWal->aPlogBody = 0;
   sqlite3_free(pWal->aFrameOff);
   pWal->aFrameOff = 0;
   pWal->nFrameOff = 0;
@@ -2301,9 +2401,9 @@ static int plogCheckpoint(
         if( iFrame<=nBackfill || iFrame>mxSafeFrame || iDbpage>mxPage ){
           continue;
         }
-        iOffset = plogFrameOffset(pWal, iFrame) + PLOG_FRAME_HDRSIZE;
-        /* testcase( IS_BIG_INT(iOffset) ); // requires a 4GiB WAL file */
-        rc = sqlite3OsRead(pWal->pWalFd, zBuf, szPage, iOffset);
+        /* The frame may hold only the bytes that changed, so the page has to
+        ** be put back together rather than read out. */
+        rc = plogReadPageContent(pWal, iFrame, szPage, zBuf);
         if( rc!=SQLITE_OK ) break;
         iOffset = (iDbpage-1)*(i64)szPage;
         testcase( IS_BIG_INT(iOffset) );
@@ -2799,7 +2899,7 @@ static int plogBeginShmUnreliable(Wal *pWal, int *pChanged){
   /* Allocate a buffer to read frames into */
   assert( (pWal->szPage & (pWal->szPage-1))==0 );
   assert( pWal->szPage>=512 && pWal->szPage<=65536 );
-  szFrame = pWal->szPage + PLOG_FRAME_HDRSIZE;
+  szFrame = pWal->szPage + PLOG_FRAME_HDRSIZE + 65536;
   aFrame = (u8 *)sqlite3_malloc64(szFrame);
   if( aFrame==0 ){
     rc = SQLITE_NOMEM_BKPT;
@@ -2823,10 +2923,23 @@ static int plogBeginShmUnreliable(Wal *pWal, int *pChanged){
     u8 payloadType;             /* PLOG_PT_* of this frame */
 
     /* Read and decode the next log frame. */
-    rc = sqlite3OsRead(pWal->pWalFd, aFrame, szFrame, iOffset);
+    u32 iPrev;                  /* Previous frame for this page */
+    u16 nChain;                 /* Deltas on top of the base */
+    int nBody;
+    rc = sqlite3OsRead(pWal->pWalFd, aFrame, PLOG_FRAME_HDRSIZE, iOffset);
     if( rc!=SQLITE_OK ) break;
+    nFrameLen = sqlite3Get4byte(&aFrame[24]);
+    if( nFrameLen<PLOG_FRAME_HDRSIZE || (nFrameLen & 7)!=0 ) break;
+    nBody = (int)nFrameLen - PLOG_FRAME_HDRSIZE;
+    if( nBody>szFrame-PLOG_FRAME_HDRSIZE ) break;
+    if( nBody>0 ){
+      rc = sqlite3OsRead(pWal->pWalFd, aData, nBody,
+                         iOffset+PLOG_FRAME_HDRSIZE);
+      if( rc!=SQLITE_OK ) break;
+    }
     if( !plogDecodeFrame(pWal, &pgno, &nTruncate, &nFrameLen, &nRange,
-                         &payloadType, aData, pWal->szPage, aFrame) ) break;
+                         &payloadType, &iPrev, &nChain,
+                         aData, nBody, aFrame) ) break;
     iOffset += nFrameLen;
 
     /* If nTruncate is non-zero, then a complete transaction has been
@@ -3221,8 +3334,7 @@ static int plogSnapshotRecover(
       iDbOff = (i64)(pgno-1) * szPage;
 
       if( iDbOff+szPage<=szDb ){
-        iWalOff = plogFrameOffset(pWal, i) + PLOG_FRAME_HDRSIZE;
-        rc = sqlite3OsRead(pWal->pWalFd, pBuf1, szPage, iWalOff);
+        rc = plogReadPageContent(pWal, i, szPage, pBuf1);
 
         if( rc==SQLITE_OK ){
           rc = sqlite3OsRead(pWal->pDbFd, pBuf2, szPage, iDbOff);
@@ -3568,6 +3680,92 @@ int plogWalFindFrame(
 ** (which is nOut bytes in size). Return SQLITE_OK if successful, or an
 ** error code otherwise.
 */
+/*
+** Apply the ranges carried by one PLOG_PT_RANGES frame to pOut.
+**
+** The range table is read into a small array and then each range's bytes are
+** read straight into their place in the page, so no buffer the size of a
+** page is needed.
+*/
+static int plogApplyRanges(Wal *pWal, u32 iFrame, u16 nRange, int szPage, u8 *pOut){
+  u8 aTbl[4*PLOG_MAXRANGE];
+  i64 iOff = plogFrameOffset(pWal, iFrame);
+  i64 iData;
+  int i, rc;
+
+  if( iOff<0 ) return SQLITE_IOERR_READ;
+  if( nRange>PLOG_MAXRANGE ) return SQLITE_CORRUPT_BKPT;
+  if( nRange==0 ) return SQLITE_OK;
+  iOff += PLOG_FRAME_HDRSIZE;
+  rc = sqlite3OsRead(pWal->pWalFd, aTbl, 4*nRange, iOff);
+  if( rc!=SQLITE_OK ) return rc;
+  iData = iOff + 4*nRange;
+  for(i=0; i<nRange; i++){
+    int off = aTbl[4*i] | (aTbl[4*i+1]<<8);
+    int len = aTbl[4*i+2] | (aTbl[4*i+3]<<8);
+    if( off<0 || len<0 || off+len>szPage ) return SQLITE_CORRUPT_BKPT;
+    rc = sqlite3OsRead(pWal->pWalFd, pOut+off, len, iData);
+    if( rc!=SQLITE_OK ) return rc;
+    iData += len;
+  }
+  return SQLITE_OK;
+}
+
+/*
+** Put the content of the page that frame iRead describes into pOut.
+**
+** A whole-page frame is read straight out.  A delta frame is applied on top
+** of a base, which is frame iPrev's content when there is one and the page in
+** the database file otherwise; see the frame format comment for why the
+** database file is allowed to serve as the base.
+*/
+static int plogReadPageContent(Wal *pWal, u32 iRead, int szPage, u8 *pOut){
+  u32 aChain[PLOG_MAXCHAIN+2];  /* iRead first, oldest last */
+  u16 aRange[PLOG_MAXCHAIN+2];
+  int n = 0;
+  u32 i = iRead;
+  u32 pgno = 0;
+  u8 pt = PLOG_PT_FULL;
+  int rc;
+
+  while( i>0 ){
+    u8 aHdr[PLOG_FRAME_HDRSIZE];
+    i64 iOff = plogFrameOffset(pWal, i);
+    if( iOff<0 ) return SQLITE_IOERR_READ;
+    rc = sqlite3OsRead(pWal->pWalFd, aHdr, sizeof(aHdr), iOff);
+    if( rc!=SQLITE_OK ) return rc;
+    if( n==0 ) pgno = sqlite3Get4byte(&aHdr[0]);
+    if( n>PLOG_MAXCHAIN+1 ) return SQLITE_CORRUPT_BKPT;
+    aChain[n] = i;
+    aRange[n] = (u16)(aHdr[28] | (aHdr[29]<<8));
+    pt = aHdr[30];
+    n++;
+    if( pt==PLOG_PT_FULL ) break;
+    i = sqlite3Get4byte(&aHdr[32]);
+  }
+  if( n==0 ) return SQLITE_CORRUPT_BKPT;
+
+  if( pt==PLOG_PT_FULL ){
+    i64 iOff = plogFrameOffset(pWal, aChain[n-1]);
+    if( iOff<0 ) return SQLITE_IOERR_READ;
+    rc = sqlite3OsRead(pWal->pWalFd, pOut, szPage, iOff+PLOG_FRAME_HDRSIZE);
+    if( rc!=SQLITE_OK ) return rc;
+    n--;                        /* that one is the base, not a delta */
+  }else{
+    /* base is the database page.  A page past the end of the file reads as
+    ** zeroes, which is what a fresh page starts out as. */
+    rc = sqlite3OsRead(pWal->pDbFd, pOut, szPage, (i64)(pgno-1)*szPage);
+    if( rc==SQLITE_IOERR_SHORT_READ ) rc = SQLITE_OK;
+    if( rc!=SQLITE_OK ) return rc;
+  }
+
+  while( --n >= 0 ){
+    rc = plogApplyRanges(pWal, aChain[n], aRange[n], szPage, pOut);
+    if( rc!=SQLITE_OK ) return rc;
+  }
+  return SQLITE_OK;
+}
+
 static int plogWalReadFrame(
   Wal *pWal,                      /* WAL handle */
   u32 iRead,                      /* Frame to read */
@@ -3575,16 +3773,12 @@ static int plogWalReadFrame(
   u8 *pOut                        /* Buffer to write page data to */
 ){
   int sz;
-  i64 iOffset;
   sz = pWal->hdr.szPage;
   sz = (sz&0xfe00) + ((sz&0x0001)<<16);
   testcase( sz<=32768 );
   testcase( sz>=65536 );
-  iOffset = plogFrameOffset(pWal, iRead);
-  if( iOffset<0 ) return SQLITE_IOERR_READ;
-  iOffset += PLOG_FRAME_HDRSIZE;
-  /* testcase( IS_BIG_INT(iOffset) ); // requires a 4GiB WAL */
-  return sqlite3OsRead(pWal->pWalFd, pOut, (nOut>sz ? sz : nOut), iOffset);
+  if( nOut<sz ) return SQLITE_CORRUPT_BKPT;
+  return plogReadPageContent(pWal, iRead, sz, pOut);
 }
 
 /*
@@ -3607,7 +3801,16 @@ static int plogWalReadFrameRaw(
   iOffset = plogFrameOffset(pWal, iRead);
   if( iOffset<0 ) return SQLITE_IOERR_READ;
   /* testcase( IS_BIG_INT(iOffset) ); // requires a 4GiB WAL */
-  sz += PLOG_FRAME_HDRSIZE;
+  /* Frames vary in length, so hand back as much of this one as fits. */
+  {
+    u8 aHdr[PLOG_FRAME_HDRSIZE];
+    u32 nFrame;
+    int rc = sqlite3OsRead(pWal->pWalFd, aHdr, sizeof(aHdr), iOffset);
+    if( rc!=SQLITE_OK ) return rc;
+    nFrame = sqlite3Get4byte(&aHdr[24]);
+    if( nFrame<PLOG_FRAME_HDRSIZE ) return SQLITE_CORRUPT_BKPT;
+    sz = (int)nFrame;
+  }
   return sqlite3OsRead(pWal->pWalFd, pOut, (nOut>sz ? sz : nOut), iOffset);
 }
 
@@ -3909,41 +4112,43 @@ static int plogWriteToLog(
 ** Write out a single frame of the WAL
 */
 static int plogWriteOneFrame(
-  PlogWriter *p,               /* Where to write the frame */
-  PgHdr *pPage,               /* The page of the frame to be written */
+  PlogWriter *p,              /* Where to write the frame */
+  u32 pgno,                   /* Database page this frame describes */
   int nTruncate,              /* The commit flag.  Usually 0.  >0 for commit */
   sqlite3_int64 iOffset,      /* Byte offset at which to write */
-  u32 nFrame                  /* Footprint of the frame; >= header + page */
+  u32 nFrame,                 /* Footprint of the frame, a multiple of 8 */
+  u16 nRange,                 /* Ranges in the body (PLOG_PT_RANGES only) */
+  u8 payloadType,             /* PLOG_PT_* */
+  u32 iPrev,                  /* Previous frame for this page, or 0 */
+  u16 nChain,                 /* Deltas on top of the base */
+  u8 *aBody,                  /* Body bytes */
+  int nBody                   /* Bytes of aBody; a multiple of 8 */
 ){
   int rc;                         /* Result code from subfunctions */
-  void *pData;                    /* Data actually written */
-  u32 nSlack;                     /* Padding after the page, if any */
+  int nPad = (int)nFrame - PLOG_FRAME_HDRSIZE - nBody;
   u8 aFrame[PLOG_FRAME_HDRSIZE];   /* Buffer to assemble frame-header in */
-  pData = pPage->pData;
-  rc = libsql_pager_codec(pPage, &pData);
-  if( rc ) return rc;
 
-  plogEncodeFrame(p->pWal, pPage->pgno, nTruncate, nFrame, 0, PLOG_PT_FULL,
-                  (u8*)pData, p->szPage, aFrame);
+  plogEncodeFrame(p->pWal, pgno, nTruncate, nFrame, nRange, payloadType,
+                  iPrev, nChain, aBody, nBody, nPad, aFrame);
   rc = plogWriteToLog(p, aFrame, sizeof(aFrame), iOffset);
   if( rc ) return rc;
-  /* Write the page data */
-  rc = plogWriteToLog(p, pData, p->szPage, iOffset+sizeof(aFrame));
-  if( rc ) return rc;
-
-  /* Zero the slack so the sector is fully written, which is the whole point
-  ** of padding out to its boundary.  It is never read back. */
-  nSlack = nFrame - PLOG_FRAME_HDRSIZE - (u32)p->szPage;
-  if( nSlack>0 ){
+  if( nBody>0 ){
+    rc = plogWriteToLog(p, aBody, nBody, iOffset+PLOG_FRAME_HDRSIZE);
+    if( rc ) return rc;
+  }
+  /* Zero the padding, which is the whole point of running out to a sector
+  ** boundary.  It is part of the body as far as the checksum is concerned. */
+  if( nPad>0 ){
     u8 aZero[256];
-    i64 iAt = iOffset + PLOG_FRAME_HDRSIZE + p->szPage;
+    i64 iAt = iOffset + PLOG_FRAME_HDRSIZE + nBody;
+    int n = nPad;
     memset(aZero, 0, sizeof(aZero));
-    while( nSlack>0 ){
-      int n = nSlack>sizeof(aZero) ? (int)sizeof(aZero) : (int)nSlack;
-      rc = plogWriteToLog(p, aZero, n, iAt);
+    while( n>0 ){
+      int k = n>(int)sizeof(aZero) ? (int)sizeof(aZero) : n;
+      rc = plogWriteToLog(p, aZero, k, iAt);
       if( rc ) return rc;
-      iAt += n;
-      nSlack -= n;
+      iAt += k;
+      n -= k;
     }
   }
   return SQLITE_OK;
@@ -3970,9 +4175,6 @@ static int plogFrames(
   int rc;                         /* Used to catch return codes */
   u32 iFrame;                     /* Next frame address */
   PgHdr *p;                       /* Iterator to run through pList with. */
-  int szFrame;                    /* Header plus a whole page */
-  PgHdr *pCommit = 0;             /* Page that carries the commit mark */
-  int nSkip = 0;                  /* Pages left out because nothing changed */
   i64 iOffset;                    /* Next byte to write in WAL file */
   PlogWriter w;                    /* The writer */
   WalIndexHdr *pLive;             /* Pointer to shared header */
@@ -4059,7 +4261,6 @@ static int plogFrames(
   w.szPage = szPage;
   iOffset = plogFrameOffset(pWal, iFrame+1);
   if( iOffset<0 ) return SQLITE_IOERR_WRITE;
-  szFrame = szPage + PLOG_FRAME_HDRSIZE;
 
   /* Write all frames into the log file exactly once.
   **
@@ -4070,50 +4271,101 @@ static int plogFrames(
   ** dead bytes when a page is spilled and then committed, and the checksum
   ** rewrite that in-place overwriting needs is no longer reachable.
   */
-  /* Which page carries the commit mark.  wal.c always puts it on the last
-  ** page of the list, but that page may have nothing to log and be skipped
-  ** below, and then recovery would find no commit.  Hand the mark to the last
-  ** page that does get a frame; if nothing does, keep the last page so there
-  ** is somewhere to put it. */
-  if( isCommit ){
-    PgHdr *pMark = 0;
-    for(p=pList; p; p=p->pDirty){
-      libsql_page_delta *pD = (libsql_page_delta*)p->pPlogDelta;
-      if( pD==0 || pD->pgno!=p->pgno || pD->nRange>0 ) pMark = p;
-      pCommit = p;
-    }
-    if( pMark ) pCommit = pMark;
+  if( !plogWriteStat.isInit ){
+    plogWriteStat.isInit = 1;
+    atexit(plogWriteReport);
+  }
+  if( isCommit ) plogWriteStat.nCommit++;
+
+  /* Scratch for assembling a delta body: the range table, plus at worst
+  ** every byte of the page, plus room to round the length up to 8. */
+  if( pWal->aPlogBody==0 ){
+    pWal->aPlogBody = sqlite3_malloc(4*PLOG_MAXRANGE + szPage + 8);
+    if( pWal->aPlogBody==0 ) return SQLITE_NOMEM_BKPT;
   }
 
   for(p=pList; p; p=p->pDirty){
-    int nDbSize;   /* 0 normally.  Positive == commit flag */
-    u32 nFrame = (u32)szFrame;
+    int nDbSize;                  /* 0 normally.  Positive == commit flag */
     libsql_page_delta *pD = (libsql_page_delta*)p->pPlogDelta;
+    u32 iPrev = 0;                /* This page's previous frame, if any */
+    u16 nChain = 0;               /* Deltas this frame sits on top of */
+    u16 nRange = 0;
+    u8 pt = PLOG_PT_FULL;
+    u8 *aBody;
+    int nBody;
+    u32 nFrame;
 
-    /* A page the transaction left byte for byte as it was needs no frame: the
-    ** copy already in the log or the database file is the right content, and
-    ** leaving it out of the index means readers keep finding that copy.  This
-    ** is where most of the saving is - three quarters of the pages handed to
-    ** the log by a DiskANN block write are in this state. */
-    if( pD!=0 && pD->pgno==p->pgno && pD->nRange==0 && p!=pCommit ){
-      p->flags &= ~PGHDR_WAL_APPEND;
-      nSkip++;
-      continue;
+    /* Write only the bytes that changed, when the comparison in pager.c
+    ** found them and this page's delta chain is still short enough that
+    ** reading it back stays cheap. */
+    if( pD!=0 && pD->pgno==p->pgno && pD->nRange<=PLOG_MAXRANGE ){
+      u16 nChainPrev = 0;
+      u8 ptPrev = PLOG_PT_FULL;
+      plogWalFindFrame(pWal, p->pgno, &iPrev);
+      if( iPrev>0 ){
+        u8 aHdr[PLOG_FRAME_HDRSIZE];
+        i64 iHdrOff = plogFrameOffset(pWal, iPrev);
+        if( iHdrOff<0 ) return SQLITE_IOERR_READ;
+        rc = sqlite3OsRead(pWal->pWalFd, aHdr, sizeof(aHdr), iHdrOff);
+        if( rc!=SQLITE_OK ) return rc;
+        ptPrev = aHdr[30];
+        nChainPrev = (u16)(aHdr[36] | (aHdr[37]<<8));
+        plogWriteStat.nRepeat++;
+      }
+      nChain = (u16)((iPrev>0 && ptPrev!=PLOG_PT_FULL) ? nChainPrev+1 : 1);
+      if( nChain<=PLOG_MAXCHAIN ) pt = PLOG_PT_RANGES;
     }
 
-    nDbSize = (isCommit && p==pCommit) ? nTruncate : 0;
+    if( pt==PLOG_PT_RANGES ){
+      /* body: the range table, then the bytes of each range in turn */
+      int i, n = 0;
+      nRange = pD->nRange;
+      aBody = pWal->aPlogBody;
+      for(i=0; i<nRange; i++){
+        u16 off = pD->aRange[2*i];
+        u16 len = pD->aRange[2*i+1];
+        aBody[n++] = (u8)(off & 0xff);
+        aBody[n++] = (u8)(off >> 8);
+        aBody[n++] = (u8)(len & 0xff);
+        aBody[n++] = (u8)(len >> 8);
+      }
+      for(i=0; i<nRange; i++){
+        u16 off = pD->aRange[2*i];
+        u16 len = pD->aRange[2*i+1];
+        memcpy(&aBody[n], (u8*)p->pData + off, len);
+        n += len;
+      }
+      while( n & 7 ) aBody[n++] = 0;
+      nBody = n;
+      plogWriteStat.nDelta++;
+    }else{
+      void *pData = p->pData;
+      rc = libsql_pager_codec(p, &pData);
+      if( rc ) return rc;
+      aBody = (u8*)pData;
+      nBody = szPage;
+      iPrev = 0;                  /* a whole page stands on its own */
+      nChain = 0;
+      nRange = 0;
+    }
+
+    nDbSize = (isCommit && p->pDirty==0) ? nTruncate : 0;
+    nFrame = (u32)(PLOG_FRAME_HDRSIZE + nBody);
     if( nDbSize && WAL_SYNC_FLAGS(sync_flags)!=0 && pWal->padToSectorBoundary ){
-      /* Pad out to the next sector boundary by declaring a longer last frame.
-      ** wal.c repeats the final frame instead, which cannot land on the
-      ** boundary exactly once frames differ in length. */
+      /* Run the last frame out to the next sector boundary.  wal.c repeats
+      ** the frame instead, which cannot land on the boundary exactly once
+      ** frames differ in length. */
       int sectorSize = sqlite3SectorSize(pWal->pWalFd);
       i64 iEnd = iOffset + nFrame;
       nFrame = (u32)(((iEnd+sectorSize-1)/sectorSize)*sectorSize - iOffset);
     }
 
     iFrame++;
-    rc = plogWriteOneFrame(&w, p, nDbSize, iOffset, nFrame);
+    rc = plogWriteOneFrame(&w, p->pgno, nDbSize, iOffset, nFrame, nRange, pt,
+                           iPrev, nChain, aBody, nBody);
     if( rc ) return rc;
+    plogWriteStat.nFrame++;
+    plogWriteStat.nByte += nFrame;
     iOffset += nFrame;
     rc = plogFrameRecord(pWal, iFrame+1, iOffset);
     if( rc ) return rc;
@@ -4166,7 +4418,6 @@ static int plogFrames(
     iFrame++;
     rc = plogIndexAppend(pWal, iFrame, p->pgno);
   }
-  UNUSED_PARAMETER(nSkip);
   /* wal.c indexes the extra copies of the last frame it wrote for padding.
   ** Padding is absorbed into the last frame's own length here, so there are
   ** no extra frames to index. */
