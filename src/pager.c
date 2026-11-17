@@ -3335,6 +3335,7 @@ static void pagerPreImageTake(Pager *pPager, PgHdr *pPg){
   p = sqlite3_malloc(sizeof(*p) + pPager->pageSize);
   if( p==0 ) return;          /* measurement only; losing one is harmless */
   p->aData = (u8*)&p[1];
+  p->pDelta = 0;              /* sqlite3_malloc() does not zero */
   p->pPg = pPg;
   p->pgno = pPg->pgno;
   memcpy(p->aData, pPg->pData, pPager->pageSize);
