@@ -3258,25 +3258,34 @@ static struct PagerPlogStat {
   u64 nPageByte;              /* what the log writes today: whole pages */
   u64 nChangeByte;            /* what it would write: changed granules */
   u64 nRange;                 /* contiguous changed runs, ie range headers */
+  u64 nPageSame;              /* logged although byte for byte unchanged */
   u64 nNoPre;                 /* pages with no pre-image; counted as all new */
 } pagerPlogStat;
 
 static void pagerPlogReport(void){
   struct PagerPlogStat *p = &pagerPlogStat;
-  u64 nFrame;
+  u64 nFrame, nChanged;
+  double nSzPage;
   if( p->nPage==0 ) return;
+  nChanged = p->nPage - p->nPageSame;
+  /* average page size; the only sizes in play are powers of two */
+  nSzPage = (double)p->nPageByte / (double)p->nPage;
   /* 12 bytes per range: page number, offset, length */
   nFrame = p->nChangeByte + p->nRange*12;
   fprintf(stderr,
     "plog-diff: pages=%llu  whole=%.1fMB  changed=%.1fMB  frames=%.1fMB"
     "  saving=%.2fx\n"
-    "           ranges=%.2f/page  changed=%.2f%% of page  no-preimage=%llu\n",
+    "           unchanged=%llu (%.1f%%, %.1fMB)  ranges=%.2f/changed-page\n"
+    "           changed=%.2f%% of page  no-preimage=%llu\n",
     (unsigned long long)p->nPage,
     p->nPageByte/1048576.0,
     p->nChangeByte/1048576.0,
     nFrame/1048576.0,
     nFrame ? (double)p->nPageByte/(double)nFrame : 0.0,
-    (double)p->nRange/(double)p->nPage,
+    (unsigned long long)p->nPageSame,
+    100.0*p->nPageSame/(double)p->nPage,
+    (double)p->nPageSame*nSzPage/1048576.0,
+    nChanged ? (double)p->nRange/(double)nChanged : 0.0,
     p->nPageByte ? 100.0*p->nChangeByte/p->nPageByte : 0.0,
     (unsigned long long)p->nNoPre);
   fflush(stderr);
@@ -3367,7 +3376,10 @@ static void pagerPreImageDiff(Pager *pPager, PgHdr *pList, int isCommit){
     /* Most pages that reach the log are not changed at all: writing a whole
     ** DiskANN block dirties every page it spans while one edge slot inside it
     ** moved.  One comparison settles those, and they cost no frame. */
-    if( memcmp(aOld, aNew, szPage)==0 ) continue;
+    if( memcmp(aOld, aNew, szPage)==0 ){
+      pStat->nPageSame++;
+      continue;
+    }
     for(i=0; i<szPage; i+=nGran){
       int n = (szPage - i < nGran) ? szPage - i : nGran;
       if( memcmp(aOld + i, aNew + i, n)!=0 ){

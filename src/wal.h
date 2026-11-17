@@ -230,6 +230,14 @@ typedef struct sqlite3_wal {
   WalIndexHdr *pSnapshot;             /* Start transaction here if not NULL */
   int bGetSnapshot;                   /* Transaction opened for sqlite3_get_snapshot() */
   sqlite3 *db;
+
+  /* Used by plog.c only.  Its frames vary in length, so a frame number no
+  ** longer maps to a file offset by arithmetic the way walFrameOffset() does
+  ** it; the offsets are kept here instead.  wal.c leaves these zero.
+  */
+  long long *aFrameOff;               /* aFrameOff[i-1] = offset of frame i */
+  unsigned int nFrameOff;             /* Frames whose offset is known */
+  unsigned int nFrameOffAlloc;        /* Allocated entries in aFrameOff */
 } sqlite3_wal;
 
 struct libsql_wal {
