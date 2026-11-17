@@ -593,8 +593,10 @@ HDR = \
    $(TOP)/src/os_common.h \
    $(TOP)/src/os_setup.h \
    $(TOP)/src/os_win.h \
+   $(TOP)/src/page_header.h \
    $(TOP)/src/pager.h \
    $(TOP)/src/pcache.h \
+   $(TOP)/src/wal.h \
    parse.h  \
    $(TOP)/src/pragma.h \
    sqlite3.h  \
