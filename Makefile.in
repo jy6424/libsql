@@ -204,7 +204,7 @@ LIBOBJS0 = alter.lo analyze.lo attach.lo auth.lo \
          vectorIndex.lo vectordiskann.lo vectorvtab.lo \
          vdbe.lo vdbeapi.lo vdbeaux.lo vdbeblob.lo vdbemem.lo vdbesort.lo \
          vdbetrace.lo vdbevtab.lo \
-         wal.lo walker.lo wasmedge_bindings.lo where.lo wherecode.lo whereexpr.lo \
+         wal.lo plog.lo walker.lo wasmedge_bindings.lo where.lo wherecode.lo whereexpr.lo \
          window.lo utf.lo vtab.lo
 
 # Object files for the amalgamation.
@@ -333,6 +333,7 @@ SRC = \
   $(TOP)/src/vxworks.h \
   $(TOP)/src/wal.c \
   $(TOP)/src/wal.h \
+  $(TOP)/src/plog.c \
   $(TOP)/src/walker.c \
   $(TOP)/src/where.c \
   $(TOP)/src/wherecode.c \
@@ -535,6 +536,7 @@ TESTSRC2 = \
   $(TOP)/src/global.c \
   $(TOP)/src/insert.c \
   $(TOP)/src/wal.c \
+  $(TOP)/src/plog.c \
   $(TOP)/src/main.c \
   $(TOP)/src/mem5.c \
   $(TOP)/src/os.c \
@@ -1217,6 +1219,9 @@ vtab.lo:	$(TOP)/src/vtab.c $(HDR)
 
 wal.lo:	$(TOP)/src/wal.c $(HDR)
 	$(LTCOMPILE) $(TEMP_STORE) -c $(TOP)/src/wal.c
+
+plog.lo:	$(TOP)/src/plog.c $(HDR)
+	$(LTCOMPILE) $(TEMP_STORE) -c $(TOP)/src/plog.c
 
 walker.lo:	$(TOP)/src/walker.c $(HDR)
 	$(LTCOMPILE) $(TEMP_STORE) -c $(TOP)/src/walker.c

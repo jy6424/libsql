@@ -254,4 +254,15 @@ RefCountedWalManager *make_sqlite3_wal_manager_rc();
 
 extern const libsql_wal_manager sqlite3_wal_manager;
 
+/*
+** plog.c - an alternative write-ahead log that records what changed inside a
+** page instead of the whole page image (physiological logging).  It plugs in
+** through the same libsql_wal_manager interface, so the pager calls it the
+** same way and the two can be compared in one binary.  Stage 0 is a straight
+** copy of wal.c, so behaviour is identical until the frame format changes.
+*/
+RefCountedWalManager *make_libsql_plog_manager_rc(void);
+
+extern const libsql_wal_manager libsql_plog_manager;
+
 #endif /* SQLITE_WAL_H */

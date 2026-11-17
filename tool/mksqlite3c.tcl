@@ -419,6 +419,7 @@ set flist {
    rowset.c
    pager.c
    wal.c
+   plog.c
 
    btmutex.c
    btree.c

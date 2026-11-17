@@ -3807,6 +3807,24 @@ opendb_out:
 
 
 /*
+** Which write-ahead log implementation the ordinary open functions use.
+** LIBSQL_PLOG=1 selects plog.c (physiological logging) instead of wal.c, so
+** the two can be compared without rebuilding or touching the callers.  Read
+** once: a process must not end up with two implementations on one file.
+*/
+static RefCountedWalManager *defaultWalManagerRc(void){
+#ifndef SQLITE_OMIT_WAL
+  static int eChoice = -1;    /* -1 not yet read, 0 wal.c, 1 plog.c */
+  if( eChoice<0 ){
+    const char *z = getenv("LIBSQL_PLOG");
+    eChoice = (z!=0 && z[0]!=0 && !(z[0]=='0' && z[1]==0)) ? 1 : 0;
+  }
+  if( eChoice==1 ) return make_libsql_plog_manager_rc();
+#endif
+  return make_sqlite3_wal_manager_rc();
+}
+
+/*
 ** Open a new database handle.
 */
 int sqlite3_open(
@@ -3814,7 +3832,7 @@ int sqlite3_open(
   sqlite3 **ppDb
 ){
   return openDatabase(zFilename, ppDb,
-                      SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL, make_sqlite3_wal_manager_rc());
+                      SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL, defaultWalManagerRc());
 }
 int sqlite3_open_v2(
   const char *filename,   /* Database filename (UTF-8) */
@@ -3822,7 +3840,7 @@ int sqlite3_open_v2(
   int flags,              /* Flags */
   const char *zVfs        /* Name of VFS module to use */
 ){
-  return openDatabase(filename, ppDb, (unsigned int)flags, zVfs, make_sqlite3_wal_manager_rc());
+  return openDatabase(filename, ppDb, (unsigned int)flags, zVfs, defaultWalManagerRc());
 }
 
 /* deprecated, only works with zWal == NULL */
@@ -3834,7 +3852,7 @@ int libsql_open(
   const char *zWal        /* Name of WAL module to use */
 ) {
   assert( zWal == NULL );
-  return openDatabase(filename, ppDb, (unsigned int)flags, zVfs, make_sqlite3_wal_manager_rc());
+  return openDatabase(filename, ppDb, (unsigned int)flags, zVfs, defaultWalManagerRc());
 }
 
 /* deprecated, only works with zWal == NULL */
@@ -3847,7 +3865,7 @@ int libsql_open_v2(
   void* pWalMethodsData   /* User data, passed to the libsql_wal struct*/
 ) {
   assert( zWal == NULL );
-  return openDatabase(filename, ppDb, (unsigned int)flags, zVfs, make_sqlite3_wal_manager_rc());
+  return openDatabase(filename, ppDb, (unsigned int)flags, zVfs, defaultWalManagerRc());
 }
 
 int libsql_open_v3(
@@ -3892,7 +3910,7 @@ int sqlite3_open16(
   zFilename8 = sqlite3ValueText(pVal, SQLITE_UTF8);
   if( zFilename8 ){
     rc = openDatabase(zFilename8, ppDb,
-                      SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL, make_sqlite3_wal_manager_rc());
+                      SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL, defaultWalManagerRc());
     assert( *ppDb || rc==SQLITE_NOMEM );
     if( rc==SQLITE_OK && !DbHasProperty(*ppDb, 0, DB_SchemaLoaded) ){
       SCHEMA_ENC(*ppDb) = ENC(*ppDb) = SQLITE_UTF16NATIVE;

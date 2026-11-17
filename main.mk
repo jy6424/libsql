@@ -80,7 +80,7 @@ LIBOBJ+= vdbe.o parse.o \
          update.o upsert.o userauth.o util.o vacuum.o \
          vdbeapi.o vdbeaux.o vdbeblob.o vdbemem.o vdbesort.o \
 	 vdbetrace.o vdbevtab.o \
-         wal.o walker.o where.o wherecode.o whereexpr.o \
+         wal.o plog.o walker.o where.o wherecode.o whereexpr.o \
          utf.o vtab.o window.o
 
 LIBOBJ += sqlite3session.o
@@ -187,6 +187,7 @@ SRC = \
   $(TOP)/src/vxworks.h \
   $(TOP)/src/wal.c \
   $(TOP)/src/wal.h \
+  $(TOP)/src/plog.c \
   $(TOP)/src/walker.c \
   $(TOP)/src/where.c \
   $(TOP)/src/wherecode.c \
@@ -401,6 +402,7 @@ TESTSRC2 = \
   $(TOP)/src/global.c \
   $(TOP)/src/insert.c \
   $(TOP)/src/wal.c \
+  $(TOP)/src/plog.c \
   $(TOP)/src/main.c \
   $(TOP)/src/mem5.c \
   $(TOP)/src/os.c \
