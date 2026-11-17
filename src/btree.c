@@ -5035,8 +5035,12 @@ static int copyPayload(
   DbPage *pDbPage           /* Page containing pPayload */
 ){
   if( eOp ){
-    /* Copy data from buffer to page (a write operation) */
-    int rc = sqlite3PagerWrite(pDbPage);
+    /* Copy data from buffer to page (a write operation).  The extent is known
+    ** here, so declare it: a BLOB write that only touches part of a page then
+    ** reaches the log as that part rather than the whole page.  See the
+    ** PagerDelta comment in pager.c. */
+    int iOff = (int)((u8*)pPayload - (u8*)sqlite3PagerGetData(pDbPage));
+    int rc = sqlite3PagerWriteRange(pDbPage, iOff, nByte);
     if( rc!=SQLITE_OK ){
       return rc;
     }

@@ -40,6 +40,14 @@ struct DiskAnnIndex {
  * Caller can re-load BlobSpot with blobSpotReload(...) method which will reopen blob at new row position
  * sqlite3_blob_reopen API can be visibly faster than close/open pair since a lot of check can be omitted
 */
+/* Dirty ranges of pBuffer one BlobSpot can track before it gives up and
+** reports the whole block.  An edge update touches three places - the edge
+** vector, its metadata and the edge count - and those sit tens of kilobytes
+** apart, so three is the useful minimum.  Pruning deletes several edges
+** before flushing, which is what the rest of the room is for.
+*/
+#define DISKANN_MAXRANGE 16
+
 struct BlobSpot {
   u64 nRowid;           /* last rowid for which open/reopen was called; undefined if BlobSpot was never opened */
   sqlite3_blob *pBlob;  /* BLOB handle */
@@ -48,6 +56,12 @@ struct BlobSpot {
   u8 isWritable;        /* blob open mode (readonly or read/write) */
   u8 isInitialized;     /* was blob read after creation or not */
   u8 isAborted;         /* set to true if last operation with blob failed with non-zero code */
+  /* What the nodeBin* writers changed in pBuffer since the last flush, as
+  ** {offset, length} pairs sorted by offset and never overlapping.  Writing
+  ** only these leaves the pages the change did not fall in clean, so they
+  ** never reach the log at all.  Empty means nothing changed. */
+  u16 nRange;
+  unsigned int aRange[2*DISKANN_MAXRANGE];
 };
 
 /* Special error code for blobSpotCreate/blobSpotReload functions which will fire where rowid doesn't exists in the table */

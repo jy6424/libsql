@@ -469,6 +469,8 @@ HDR = \
    $(TOP)/src/sqliteLimit.h \
    $(TOP)/src/vdbe.h \
    $(TOP)/src/vdbeInt.h \
+   $(TOP)/src/vectorInt.h \
+   $(TOP)/src/vectorIndexInt.h \
    $(TOP)/src/vxworks.h \
    $(TOP)/src/whereInt.h
 

@@ -297,6 +297,101 @@ static int blobSpotConvertRc(const DiskAnnIndex *pIndex, int rc){
   return rc;
 }
 
+/*
+** Narrow writes.  blobSpotFlush() normally hands the whole block back to
+** sqlite3_blob_write(), which dirties every page the block spans - about ten
+** of them - although a single edge update changes 814 bytes of it.  With this
+** on, only the ranges the nodeBin* writers recorded are written, so the pages
+** the change did not fall in stay clean and never reach the log or the
+** checkpoint.
+**
+** Off by default: the two have to be measurable against each other, and
+** against physiological logging, which cuts a different part of the same
+** waste (what is logged for a page that did change).
+*/
+static int diskAnnNarrowState = 0;    /* 0 unread, 1 on, 2 off */
+
+static int blobSpotNarrow(void){
+  if( diskAnnNarrowState==0 ){
+    const char *z = getenv("LIBSQL_DISKANN_NARROW");
+    diskAnnNarrowState = (z!=0 && z[0]!='0') ? 1 : 2;
+  }
+  return diskAnnNarrowState==1;
+}
+
+/*
+** What narrowing actually saved, against what the whole-block write would
+** have handed to the pager.
+*/
+static struct DiskAnnNarrowStat {
+  u64 nFlush;                 /* blobSpotFlush() calls that wrote something */
+  u64 nRange;                 /* sqlite3_blob_write() calls those made */
+  u64 nByte;                  /* bytes they wrote */
+  u64 nWholeByte;             /* bytes a whole-block write would have */
+  int isInit;
+} diskAnnNarrowStat;
+
+static void diskAnnNarrowReport(void){
+  struct DiskAnnNarrowStat *p = &diskAnnNarrowStat;
+  if( p->nFlush==0 ) return;
+  fprintf(stderr,
+    "diskann-narrow: flushes=%llu  ranges=%llu (%.2f/flush)\n"
+    "                wrote=%.1fMB  whole-block=%.1fMB  saving=%.2fx\n",
+    (unsigned long long)p->nFlush, (unsigned long long)p->nRange,
+    (double)p->nRange/(double)p->nFlush,
+    p->nByte/1048576.0, p->nWholeByte/1048576.0,
+    p->nByte ? (double)p->nWholeByte/(double)p->nByte : 0.0);
+  fflush(stderr);
+}
+
+/*
+** Record that [iOff, iOff+nByte) of pBlobSpot->pBuffer has changed.  The
+** table stays sorted by offset with no two ranges overlapping or touching.
+**
+** When it runs out of room the whole block is reported instead.  Over-
+** reporting only costs bytes; losing a range would lose the change, so the
+** fallback has to go this way.
+*/
+static void blobSpotDirty(BlobSpot *pBlobSpot, int iOff, int nByte){
+  unsigned int *a = pBlobSpot->aRange;
+  unsigned int iBeg = (unsigned int)iOff;
+  unsigned int iEnd = (unsigned int)(iOff + nByte);
+  int n = pBlobSpot->nRange;
+  int i, j;
+
+  assert( iOff>=0 && nByte>0 && iOff+nByte<=pBlobSpot->nBufferSize );
+
+  /* First range that does not end before iBeg.  Ranges before i are
+  ** untouched by this write. */
+  for(i=0; i<n && a[2*i]+a[2*i+1] < iBeg; i++){}
+
+  /* Ranges from i that start at or before iEnd merge into one with it. */
+  for(j=i; j<n && a[2*j] <= iEnd; j++){
+    if( a[2*j] < iBeg ) iBeg = a[2*j];
+    if( a[2*j]+a[2*j+1] > iEnd ) iEnd = a[2*j]+a[2*j+1];
+  }
+  if( j>i ){
+    a[2*i] = iBeg;
+    a[2*i+1] = iEnd - iBeg;
+    if( j>i+1 ){
+      memmove(&a[2*(i+1)], &a[2*j], (n-j)*2*sizeof(a[0]));
+      pBlobSpot->nRange = (u16)(n - (j-i-1));
+    }
+    return;
+  }
+
+  if( n==DISKANN_MAXRANGE ){
+    a[0] = 0;
+    a[1] = (unsigned int)pBlobSpot->nBufferSize;
+    pBlobSpot->nRange = 1;
+    return;
+  }
+  memmove(&a[2*(i+1)], &a[2*i], (n-i)*2*sizeof(a[0]));
+  a[2*i] = iBeg;
+  a[2*i+1] = iEnd - iBeg;
+  pBlobSpot->nRange = (u16)(n+1);
+}
+
 int blobSpotCreate(const DiskAnnIndex *pIndex, BlobSpot **ppBlobSpot, u64 nRowid, int nBufferSize, int isWritable) {
   int rc = SQLITE_OK;
   BlobSpot *pBlobSpot;
@@ -329,6 +424,7 @@ int blobSpotCreate(const DiskAnnIndex *pIndex, BlobSpot **ppBlobSpot, u64 nRowid
   pBlobSpot->isWritable = isWritable;
   pBlobSpot->isInitialized = 0;
   pBlobSpot->isAborted = 0;
+  pBlobSpot->nRange = 0;
 
   *ppBlobSpot = pBlobSpot;
   return SQLITE_OK;
@@ -385,6 +481,8 @@ int blobSpotReload(DiskAnnIndex *pIndex, BlobSpot *pBlobSpot, u64 nRowid, int nB
   if( rc != SQLITE_OK ){
     goto abort;
   }
+  /* The buffer now holds what the row holds, so nothing in it is pending. */
+  pBlobSpot->nRange = 0;
   pIndex->nReads++;
   DISKANN_STAT_READ(pIndex);
   pBlobSpot->isInitialized = 1;
@@ -397,12 +495,36 @@ abort:
 }
 
 int blobSpotFlush(DiskAnnIndex* pIndex, BlobSpot *pBlobSpot) {
-  int rc = sqlite3_blob_write(pBlobSpot->pBlob, pBlobSpot->pBuffer, pBlobSpot->nBufferSize, 0);
-  if( rc != SQLITE_OK ){
-    return rc;
+  int rc;
+  if( !diskAnnNarrowStat.isInit ){
+    diskAnnNarrowStat.isInit = 1;
+    atexit(diskAnnNarrowReport);
   }
+  diskAnnNarrowStat.nFlush++;
+  diskAnnNarrowStat.nWholeByte += (u64)pBlobSpot->nBufferSize;
+  if( blobSpotNarrow() ){
+    int i;
+    for(i = 0; i < pBlobSpot->nRange; i++){
+      int iOff = (int)pBlobSpot->aRange[2*i];
+      int nByte = (int)pBlobSpot->aRange[2*i+1];
+      diskAnnNarrowStat.nRange++;
+      diskAnnNarrowStat.nByte += (u64)nByte;
+      rc = sqlite3_blob_write(pBlobSpot->pBlob, pBlobSpot->pBuffer + iOff, nByte, iOff);
+      if( rc != SQLITE_OK ){
+        return rc;
+      }
+    }
+  }else{
+    diskAnnNarrowStat.nRange++;
+    diskAnnNarrowStat.nByte += (u64)pBlobSpot->nBufferSize;
+    rc = sqlite3_blob_write(pBlobSpot->pBlob, pBlobSpot->pBuffer, pBlobSpot->nBufferSize, 0);
+    if( rc != SQLITE_OK ){
+      return rc;
+    }
+  }
+  pBlobSpot->nRange = 0;
   pIndex->nWrites++;
-  return rc;
+  return SQLITE_OK;
 }
 
 void blobSpotFree(BlobSpot *pBlobSpot) {
@@ -461,6 +583,10 @@ void nodeBinInit(const DiskAnnIndex *pIndex, BlobSpot *pBlobSpot, u64 nRowid, Ve
   // neighbours count already zero after memset - no need to set it explicitly
 
   vectorSerializeToBlob(pVector, pBlobSpot->pBuffer + nodeMetadataSize(pIndex->nFormatVersion), pIndex->nNodeVectorSize);
+
+  /* The memset above touched every byte, so a new node writes its whole
+  ** block however narrow the other writers are. */
+  blobSpotDirty(pBlobSpot, 0, pBlobSpot->nBufferSize);
 }
 
 void nodeBinVector(const DiskAnnIndex *pIndex, const BlobSpot *pBlobSpot, Vector *pVector) {
@@ -515,6 +641,7 @@ void nodeBinPruneEdges(const DiskAnnIndex *pIndex, BlobSpot *pBlobSpot, int nPru
   assert( 0 <= nPruned && nPruned <= nodeBinEdges(pIndex, pBlobSpot) );
 
   writeLE16(pBlobSpot->pBuffer + sizeof(u64), nPruned);
+  blobSpotDirty(pBlobSpot, sizeof(u64), sizeof(u16));
 }
 
 // replace edge at position iReplace or add new one if iReplace == nEdges
@@ -541,6 +668,13 @@ void nodeBinReplaceEdge(const DiskAnnIndex *pIndex, BlobSpot *pBlobSpot, int iRe
   writeLE64(pBlobSpot->pBuffer + edgeMetaOffset + sizeof(u64), nRowid);
 
   writeLE16(pBlobSpot->pBuffer + sizeof(u64), nEdges);
+
+  /* The vector and its metadata sit tens of kilobytes apart, so these land in
+  ** different pages; the two metadata writes are adjacent and merge. */
+  blobSpotDirty(pBlobSpot, edgeVectorOffset, pIndex->nEdgeVectorSize);
+  blobSpotDirty(pBlobSpot, edgeMetaOffset + sizeof(u32), sizeof(u32));
+  blobSpotDirty(pBlobSpot, edgeMetaOffset + sizeof(u64), sizeof(u64));
+  blobSpotDirty(pBlobSpot, sizeof(u64), sizeof(u16));
 }
 
 // delete edge at position iDelete by swapping it with the last edge
@@ -563,9 +697,12 @@ void nodeBinDeleteEdge(const DiskAnnIndex *pIndex, BlobSpot *pBlobSpot, int iDel
   if( edgeVectorOffset < lastVectorOffset ){
     memmove(pBlobSpot->pBuffer + edgeVectorOffset, pBlobSpot->pBuffer + lastVectorOffset, pIndex->nEdgeVectorSize);
     memmove(pBlobSpot->pBuffer + edgeMetaOffset, pBlobSpot->pBuffer + lastMetaOffset, edgeMetadataSize(pIndex->nFormatVersion));
+    blobSpotDirty(pBlobSpot, edgeVectorOffset, pIndex->nEdgeVectorSize);
+    blobSpotDirty(pBlobSpot, edgeMetaOffset, edgeMetadataSize(pIndex->nFormatVersion));
   }
 
   writeLE16(pBlobSpot->pBuffer + sizeof(u64), nEdges - 1);
+  blobSpotDirty(pBlobSpot, sizeof(u64), sizeof(u16));
 }
 
 void nodeBinDebug(const DiskAnnIndex *pIndex, const BlobSpot *pBlobSpot) {

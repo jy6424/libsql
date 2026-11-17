@@ -163,6 +163,7 @@ void sqlite3PagerUnrefPageOne(DbPage*);
 
 /* Operations on page references. */
 int sqlite3PagerWrite(DbPage*);
+int sqlite3PagerWriteRange(DbPage*, int, int);
 void sqlite3PagerDontWrite(DbPage*);
 int sqlite3PagerMovepage(Pager*,DbPage*,Pgno,int);
 int sqlite3PagerPageRefcount(DbPage*);

@@ -547,13 +547,13 @@ static struct PlogWriteStat {
   u64 nFrame;                 /* Frames appended */
   u64 nByte;                  /* Bytes of those frames, padding included */
   u64 nCommit;                /* Frame sets completing a transaction */
-  /* Writing only the bytes that changed needs a full image of the page to
-  ** apply them to, and that image has to live in the log: the database file
-  ** cannot serve as the base, because a checkpoint overwrites it and the
-  ** delta would then be applied twice.  So a page's first frame in each log
-  ** cycle is necessarily a whole page, and only later frames for the same
-  ** page can be deltas.  These two counters say how often that happens -
-  ** they decide whether a delta format can pay for itself here. */
+  /* Writing only the bytes that changed needs a base to apply them to.  Here
+  ** that base is frame iPrev when the page already has a frame in this log
+  ** cycle, and the database page itself otherwise - see the frame format
+  ** above for what that costs.  So a page's first frame in a cycle is a whole
+  ** page only when the pager had no pre-image to compare against (a page past
+  ** the end of the database file at the start of the transaction).  These two
+  ** counters say how often each case comes up. */
   u64 nRepeat;                /* Frames for a page already in the log */
   u64 nDelta;                 /* Frames that carried ranges, not a page */
   int isInit;
@@ -4295,10 +4295,12 @@ static int plogFrames(
     int nBody;
     u32 nFrame;
 
-    /* Write only the bytes that changed, when the comparison in pager.c
-    ** found them and this page's delta chain is still short enough that
-    ** reading it back stays cheap. */
-    if( pD!=0 && pD->pgno==p->pgno && pD->nRange<=PLOG_MAXRANGE ){
+    /* Write only the bytes that changed, when the writer in btree.c declared
+    ** them and this page's delta chain is still short enough that reading it
+    ** back stays cheap.  No delta, a delta for some other page, or one marked
+    ** whole all mean the full page goes in - see pager.c. */
+    if( pD!=0 && pD->pgno==p->pgno && !pD->isWhole
+     && pD->nRange>0 && pD->nRange<=PLOG_MAXRANGE ){
       u16 nChainPrev = 0;
       u8 ptPrev = PLOG_PT_FULL;
       plogWalFindFrame(pWal, p->pgno, &iPrev);
@@ -4907,7 +4909,7 @@ static int plogWalOpen(
   assert( 32768 ==  PLOGINDEX_PGSZ        );
   assert(     8 ==  SQLITE_SHM_NLOCK     );
   assert(     5 ==  PLOG_NREADER          );
-  assert(    24 ==  PLOG_FRAME_HDRSIZE    );
+  assert(    40 ==  PLOG_FRAME_HDRSIZE    );
   assert(    32 ==  PLOG_HDRSIZE          );
   assert(   120 ==  PLOGINDEX_LOCK_OFFSET + PLOG_WRITE_LOCK   );
   assert(   121 ==  PLOGINDEX_LOCK_OFFSET + PLOG_CKPT_LOCK    );

@@ -160,12 +160,16 @@ typedef struct libsql_wal_methods {
 */
 typedef struct libsql_page_delta libsql_page_delta;
 struct libsql_page_delta {
-  unsigned int pgno;                  /* Page this describes; guards against a
-                                      ** recycled libsql_pghdr still pointing
-                                      ** at an earlier page's delta */
-  unsigned short nRange;              /* Pairs in aRange; 0 = unchanged */
+  unsigned int iGen;                  /* Transaction that built this; a page
+                                      ** left in the cache keeps a pointer to
+                                      ** a delta freed at the end of an
+                                      ** earlier one, so the generation and
+                                      ** not just pgno has to be checked */
+  unsigned int pgno;                  /* Page this describes */
+  unsigned short nRange;              /* Pairs in aRange */
   unsigned short nRangeAlloc;         /* Pairs aRange has room for */
   unsigned int nByte;                 /* Total of the lengths in aRange */
+  unsigned char isWhole;              /* Log the whole page, ignore aRange */
   unsigned short aRange[2];           /* {offset, length} pairs */
 };
 

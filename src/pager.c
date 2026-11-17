@@ -617,45 +617,49 @@ struct PagerSavepoint {
 */
 
 /*
-** Pre-images, for physiological logging (see plog.c).
+** Page deltas, for physiological logging (see plog.c).
 **
 ** To log what changed inside a page rather than the whole page, something has
-** to know which bytes those are.  The pager does not: sqlite3PagerWrite()
-** marks a whole page dirty and the caller then modifies it in place.
+** to know which bytes those are.  The code that makes the change does, so it
+** says: btree.c calls sqlite3PagerWriteRange() instead of
+** sqlite3PagerWrite() wherever it knows the extent of its write.  That is how
+** InnoDB's record manager emits an mlog record and how PostgreSQL's resource
+** managers emit a WAL record - the writer declares, nothing is recovered by
+** comparison afterwards, and no copy of the page has to be kept.
 **
-** So keep a copy of the page as it was when it first became writeable in this
-** transaction.  At commit the copy and the current content are compared and
-** the differing ranges are what the log needs.  The alternative - having
-** callers declare the ranges they are about to touch - would mean changing
-** every writer, and would miss the b-tree entirely; a write of a whole 32KB
-** DiskANN block would still declare the whole block even though only an edge
-** slot inside it changed.  Diffing costs one page copy and one comparison per
-** dirty page, which is nothing next to the I/O it saves.
+** A page arrives at the log in one of two states:
 **
-** One node per page dirtied, built in pager_write() and released when the
-** transaction ends.  The list is short - the pages one statement touches.
+**   isWhole, or no delta at all     log the whole page
+**   nRange ranges                   log only those bytes
+**
+** Whole is the default and it is sticky.  Every write that does not declare
+** an extent - a cell header, the freelist, a pointer map, the change counter
+** on page 1 - comes through sqlite3PagerWrite() and puts the page into that
+** state for the rest of the transaction.  A declaration that is missing or
+** wrong in the narrowing direction therefore costs bytes and never loses a
+** change; that is the only way this is allowed to fail.
+**
+** One node per page declared, released when the transaction ends.
 */
-typedef struct PagerPreImage PagerPreImage;
-struct PagerPreImage {
-  PagerPreImage *pNext;
-  PgHdr *pPg;                 /* Identity only - never dereferenced, the page
-                              ** cache may have freed it */
-  Pgno pgno;                  /* pPg->pgno, kept so the page can be released */
-  u8 *aData;                  /* Content when the page became writeable */
-  libsql_page_delta *pDelta;  /* What the comparison found, for plog.c */
+typedef struct PagerDelta PagerDelta;
+struct PagerDelta {
+  PagerDelta *pNext;
+  libsql_page_delta d;        /* Over-allocated for PAGER_PLOG_MAXRANGE */
 };
 
-/* Ranges one page is allowed to report.  Measured at 1.11 per changed page,
-** so this is never reached in practice; a page that somehow fragments more
-** than this reports one range spanning the whole of the changed region, which
-** is correct, just larger than it needs to be. */
+/* Ranges one page is allowed to report.  An edge update declares three and
+** they merge down to three distinct pages, so this is far above what the
+** workload needs; a page that fragments past it is logged whole, which is
+** correct, just larger than it needs to be. */
 #define PAGER_PLOG_MAXRANGE 32
 #ifndef SQLITE_OMIT_WAL
-static void pagerPreImageClear(Pager*);
+static void pagerDeltaClear(Pager*);
+static void pagerDeltaWhole(Pager*, PgHdr*);
+static void pagerDeltaRange(Pager*, PgHdr*, int, int);
 #else
-# define pagerPreImageTake(A,B)
-# define pagerPreImageClear(A)
-# define pagerPreImageDiff(A,B,C)
+# define pagerDeltaClear(A)
+# define pagerDeltaWhole(A,B)
+# define pagerDeltaRange(A,B,C,D)
 #endif
 
 struct Pager {
@@ -747,7 +751,8 @@ struct Pager {
                                 We leave it temporarily to keep sqlite3_filename_wal working
                               */
 #endif
-  PagerPreImage *pPreList;    /* Pre-images for this transaction; see plog.c */
+  PagerDelta *pDeltaList;     /* Page deltas for this transaction; see plog.c */
+  u32 iDeltaGen;              /* Bumped per transaction, to stale old deltas */
 };
 
 
@@ -2243,7 +2248,7 @@ static int pager_end_transaction(Pager *pPager, int hasSuper, int bCommit){
   }
   pPager->eState = PAGER_READER;
   pPager->setSuper = 0;
-  pagerPreImageClear(pPager);   /* pre-images only describe one transaction */
+  pagerDeltaClear(pPager);      /* deltas only describe one transaction */
 
   return (rc==SQLITE_OK?rc2:rc);
 }
@@ -3246,58 +3251,29 @@ static int pagerRollbackWal(Pager *pPager){
 
 #ifndef SQLITE_OMIT_WAL
 /*
-** Pre-image bookkeeping for physiological logging.  Stage 1 only measures:
-** the ranges are computed and counted but the log still writes whole pages,
-** so behaviour is unchanged and the numbers say whether the frame format is
-** worth changing.  If a page turns out to change in full there is nothing to
-** win and stage 2 should not be written.
+** Delta bookkeeping for physiological logging.  See the comment on
+** PagerDelta above for what the two states mean and why whole is the default.
 **
-** LIBSQL_PLOG      enable
-** LIBSQL_PLOG_GRAN comparison unit in bytes (default 64).  Byte-exact ranges
-**                  would be split finely enough that per-range headers cost
-**                  more than they save, so differences are rounded out to a
-**                  granule, the way SQLite/PPL rounds to a log sector.
+** LIBSQL_PLOG   enable
 */
 static int pagerPlogState = 0;        /* 0 unread, 1 on, 2 off */
-static int pagerPlogGran = 64;
 
 static struct PagerPlogStat {
-  u64 nPage;                  /* pages handed to the log */
-  u64 nPageByte;              /* what the log writes today: whole pages */
-  u64 nChangeByte;            /* what it would write: changed granules */
-  u64 nRange;                 /* contiguous changed runs, ie range headers */
-  u64 nPageSame;              /* logged although byte for byte unchanged */
-  u64 nNoPre;                 /* pages with no pre-image; counted as all new */
+  u64 nPage;                  /* pages that declared anything */
+  u64 nWhole;                 /* of those, ones that ended up whole */
+  u64 nOverflow;              /* whole because the range table filled up */
 } pagerPlogStat;
 
 static void pagerPlogReport(void){
   struct PagerPlogStat *p = &pagerPlogStat;
-  u64 nFrame, nChanged;
-  double nSzPage;
   if( p->nPage==0 ) return;
-  nChanged = p->nPage - p->nPageSame;
-  /* average page size; the only sizes in play are powers of two */
-  nSzPage = (double)p->nPageByte / (double)p->nPage;
-  /* What plog.c actually writes: a 32 byte frame header per changed page, a
-  ** 4 byte descriptor per range, and the changed bytes.  Pages that did not
-  ** change cost nothing - they get no frame at all. */
-  nFrame = p->nChangeByte + nChanged*32 + p->nRange*4;
   fprintf(stderr,
-    "plog-diff: pages=%llu  whole=%.1fMB  changed=%.1fMB  frames=%.1fMB"
-    "  saving=%.2fx\n"
-    "           unchanged=%llu (%.1f%%, %.1fMB)  ranges=%.2f/changed-page\n"
-    "           changed=%.2f%% of page  no-preimage=%llu\n",
+    "plog-decl: pages=%llu  declared-ranges=%llu  whole=%llu (%.1f%%)"
+    "  overflow=%llu\n",
     (unsigned long long)p->nPage,
-    p->nPageByte/1048576.0,
-    p->nChangeByte/1048576.0,
-    nFrame/1048576.0,
-    nFrame ? (double)p->nPageByte/(double)nFrame : 0.0,
-    (unsigned long long)p->nPageSame,
-    100.0*p->nPageSame/(double)p->nPage,
-    (double)p->nPageSame*nSzPage/1048576.0,
-    nChanged ? (double)p->nRange/(double)nChanged : 0.0,
-    p->nPageByte ? 100.0*p->nChangeByte/p->nPageByte : 0.0,
-    (unsigned long long)p->nNoPre);
+    (unsigned long long)(p->nPage - p->nWhole),
+    (unsigned long long)p->nWhole, 100.0*p->nWhole/(double)p->nPage,
+    (unsigned long long)p->nOverflow);
   fflush(stderr);
 }
 
@@ -3308,9 +3284,6 @@ static int pagerPlogEnabled(void){
       pagerPlogState = 2;
     }else{
       pagerPlogState = 1;
-      z = getenv("LIBSQL_PLOG_GRAN");
-      pagerPlogGran = z ? atoi(z) : 64;
-      if( pagerPlogGran < 1 ) pagerPlogGran = 1;
       atexit(pagerPlogReport);
     }
   }
@@ -3318,135 +3291,120 @@ static int pagerPlogEnabled(void){
 }
 
 /*
-** Remember pPg's content before the caller modifies it.  Called from
-** pager_write() at the point the page becomes writeable, which happens once
-** per page per transaction, so no search for an existing entry is needed.
+** The delta pPg is accumulating in this transaction, created on the first
+** declaration.  Returns 0 if the allocation failed, and the caller then
+** leaves the page whole, which is always correct.
 */
-static void pagerPreImageTake(Pager *pPager, PgHdr *pPg){
-  PagerPreImage *p;
-  if( !pagerUseWal(pPager) || !pagerPlogEnabled() ) return;
-  /* sqlite3PagerWrite() can reach pager_write() a second time for a page that
-  ** is already writeable but sits past the end of the file.  Keep the first
-  ** copy: that is the content the transaction started from. */
-  if( pPg->pgno>pPager->dbOrigSize ) return;   /* new page: all of it is new */
-  for(p=pPager->pPreList; p; p=p->pNext){
-    if( p->pPg==pPg && p->pgno==pPg->pgno ) return;
-  }
-  p = sqlite3_malloc(sizeof(*p) + pPager->pageSize);
-  if( p==0 ) return;          /* measurement only; losing one is harmless */
-  p->aData = (u8*)&p[1];
-  p->pDelta = 0;              /* sqlite3_malloc() does not zero */
-  p->pPg = pPg;
-  p->pgno = pPg->pgno;
-  memcpy(p->aData, pPg->pData, pPager->pageSize);
-  p->pNext = pPager->pPreList;
-  pPager->pPreList = p;
-}
+static libsql_page_delta *pagerDeltaOf(Pager *pPager, PgHdr *pPg){
+  PagerDelta *p;
+  libsql_page_delta *pD = (libsql_page_delta*)pPg->pPlogDelta;
 
-static void pagerPreImageClear(Pager *pPager){
-  PagerPreImage *p, *pNext;
-  for(p=pPager->pPreList; p; p=pNext){
-    pNext = p->pNext;
-    /* Do not touch p->pPg: the page cache owns that memory and may already
-    ** have freed it.  The pointer is only ever compared, never followed.
-    ** Nothing has to clear libsql_pghdr.pPlogDelta either - every page handed
-    ** to the log passes through pagerPreImageDiff(), which assigns it, and
-    ** plog.c ignores a delta whose pgno does not match the page. */
-    sqlite3_free(p->pDelta);
-    sqlite3_free(p);
+  /* A page that stays in the cache across transactions still points at the
+  ** delta that was freed at the end of the last one, so the generation has to
+  ** be checked and not just the page number. */
+  if( pD!=0 && pD->iGen==pPager->iDeltaGen && pD->pgno==pPg->pgno ){
+    return pD;
   }
-  pPager->pPreList = 0;
+  p = sqlite3_malloc(sizeof(*p) + (2*PAGER_PLOG_MAXRANGE-2)*sizeof(u16));
+  if( p==0 ){
+    pPg->pPlogDelta = 0;      /* no delta: plog.c logs the whole page */
+    return 0;
+  }
+  pD = &p->d;
+  pD->iGen = pPager->iDeltaGen;
+  pD->pgno = pPg->pgno;
+  pD->nRange = 0;
+  pD->nRangeAlloc = PAGER_PLOG_MAXRANGE;
+  pD->nByte = 0;
+  pD->isWhole = 0;
+  p->pNext = pPager->pDeltaList;
+  pPager->pDeltaList = p;
+  pPg->pPlogDelta = pD;
+  pagerPlogStat.nPage++;
+  return pD;
 }
 
 /*
-** Compare each page about to be logged against its pre-image and count what
-** a delta frame would have cost.  The pre-image is then refreshed, so that a
-** page written twice in one transaction - a cache spill followed by the
-** commit - is measured against what the log already holds rather than
-** against the start of the transaction.
+** pPg was modified without saying where, so the whole page has to be logged.
+** Sticky: declared ranges are ignored for the rest of the transaction.
 */
-static void pagerPreImageDiff(Pager *pPager, PgHdr *pList, int isCommit){
-  struct PagerPlogStat *pStat = &pagerPlogStat;
-  int nGran = pagerPlogGran;
-  int szPage = pPager->pageSize;
-  PgHdr *pPg;
-  PagerPreImage *p;
+static void pagerDeltaWhole(Pager *pPager, PgHdr *pPg){
+  libsql_page_delta *pD;
+  if( !pagerUseWal(pPager) || !pagerPlogEnabled() ) return;
+  pD = pagerDeltaOf(pPager, pPg);
+  if( pD==0 || pD->isWhole ) return;
+  pD->isWhole = 1;
+  pD->nRange = 0;
+  pD->nByte = 0;
+  pagerPlogStat.nWhole++;
+}
 
-  for(pPg=pList; pPg; pPg=pPg->pDirty){
-    const u8 *aNew = (const u8*)pPg->pData;
-    u8 *aOld = 0;
-    int i, inRun = 0;
+/*
+** [iOff, iOff+nByte) of pPg was modified.  Ranges are kept sorted by offset
+** with none overlapping or touching, so the table holds the smallest
+** description of what changed.  If it fills, the page falls back to whole.
+*/
+static void pagerDeltaRange(Pager *pPager, PgHdr *pPg, int iOff, int nByte){
+  libsql_page_delta *pD;
+  u16 *a;
+  unsigned int iBeg, iEnd;
+  int n, i, j;
 
-    pStat->nPage++;
-    pStat->nPageByte += (u64)szPage;
-    /* pgno as well as the pointer: a PgHdr freed and reused mid-transaction
-    ** would otherwise match the wrong page */
-    for(p=pPager->pPreList; p; p=p->pNext){
-      if( p->pPg==pPg && p->pgno==pPg->pgno ){ aOld = p->aData; break; }
-    }
-    if( aOld==0 ){
-      /* never became writeable through pager_write(), or the copy failed, or
-      ** the page is new: log all of it */
-      pStat->nNoPre++;
-      pStat->nChangeByte += (u64)szPage;
-      pStat->nRange++;
-      pPg->pPlogDelta = 0;
-      continue;
-    }
-    if( p->pDelta==0 ){
-      p->pDelta = sqlite3_malloc(sizeof(libsql_page_delta)
-                                 + 2*PAGER_PLOG_MAXRANGE*sizeof(u16));
-      if( p->pDelta==0 ){
-        pStat->nNoPre++;
-        pStat->nChangeByte += (u64)szPage;
-        pStat->nRange++;
-        pPg->pPlogDelta = 0;
-        continue;
-      }
-      p->pDelta->nRangeAlloc = PAGER_PLOG_MAXRANGE;
-    }
-    p->pDelta->pgno = pPg->pgno;
-    p->pDelta->nRange = 0;
-    p->pDelta->nByte = 0;
-    pPg->pPlogDelta = p->pDelta;
-    /* Most pages that reach the log are not changed at all: writing a whole
-    ** DiskANN block dirties every page it spans while one edge slot inside it
-    ** moved.  One comparison settles those, and they cost no frame. */
-    if( memcmp(aOld, aNew, szPage)==0 ){
-      pStat->nPageSame++;
-      continue;                 /* pDelta->nRange stays 0: nothing to log */
-    }
-    for(i=0; i<szPage; i+=nGran){
-      int n = (szPage - i < nGran) ? szPage - i : nGran;
-      if( memcmp(aOld + i, aNew + i, n)!=0 ){
-        libsql_page_delta *pD = p->pDelta;
-        pStat->nChangeByte += (u64)n;
-        if( !inRun ){
-          pStat->nRange++;
-          inRun = 1;
-          if( pD->nRange<pD->nRangeAlloc ){
-            pD->aRange[2*pD->nRange] = (u16)i;
-            pD->aRange[2*pD->nRange+1] = (u16)n;
-            pD->nRange++;
-          }else{
-            /* out of room: widen the last range to cover up to here */
-            int iLast = 2*(pD->nRange-1);
-            pD->aRange[iLast+1] = (u16)(i + n - pD->aRange[iLast]);
-          }
-        }else{
-          int iLast = 2*(pD->nRange-1);
-          pD->aRange[iLast+1] = (u16)(pD->aRange[iLast+1] + n);
-        }
-        pD->nByte += (u32)n;
-      }else{
-        inRun = 0;
-      }
-    }
-    /* A commit releases the pre-images straight after this, so only a spill -
-    ** where the page stays live and may be logged again - needs the baseline
-    ** moved forward to what the log now holds. */
-    if( !isCommit ) memcpy(aOld, aNew, szPage);
+  if( !pagerUseWal(pPager) || !pagerPlogEnabled() ) return;
+  if( iOff<0 || nByte<=0 || iOff+nByte>pPager->pageSize ){
+    pagerDeltaWhole(pPager, pPg);     /* cannot describe it: log it all */
+    return;
   }
+  pD = pagerDeltaOf(pPager, pPg);
+  if( pD==0 || pD->isWhole ) return;
+
+  a = pD->aRange;
+  iBeg = (unsigned int)iOff;
+  iEnd = (unsigned int)(iOff + nByte);
+  n = pD->nRange;
+
+  /* Ranges before i end before this one starts and are left alone. */
+  for(i=0; i<n && (unsigned int)a[2*i]+a[2*i+1] < iBeg; i++){}
+  /* Ranges from i that start at or before iEnd fold into this one. */
+  for(j=i; j<n && (unsigned int)a[2*j] <= iEnd; j++){
+    if( (unsigned int)a[2*j] < iBeg ) iBeg = a[2*j];
+    if( (unsigned int)a[2*j]+a[2*j+1] > iEnd ) iEnd = (unsigned int)a[2*j]+a[2*j+1];
+  }
+  if( j>i ){
+    a[2*i] = (u16)iBeg;
+    a[2*i+1] = (u16)(iEnd - iBeg);
+    if( j>i+1 ){
+      memmove(&a[2*(i+1)], &a[2*j], (n-j)*2*sizeof(a[0]));
+      pD->nRange = (u16)(n - (j-i-1));
+    }
+  }else if( n==PAGER_PLOG_MAXRANGE ){
+    pagerPlogStat.nOverflow++;
+    pagerDeltaWhole(pPager, pPg);
+    return;
+  }else{
+    memmove(&a[2*(i+1)], &a[2*i], (n-i)*2*sizeof(a[0]));
+    a[2*i] = (u16)iBeg;
+    a[2*i+1] = (u16)(iEnd - iBeg);
+    pD->nRange = (u16)(n+1);
+  }
+  pD->nByte = 0;
+  for(i=0; i<pD->nRange; i++) pD->nByte += a[2*i+1];
+}
+
+/*
+** Release this transaction's deltas.  libsql_pghdr.pPlogDelta is deliberately
+** left pointing at freed memory: the page cache owns those headers and may
+** already have freed them, so they must not be touched here.  The generation
+** stamp in each delta is what makes the stale pointers detectable.
+*/
+static void pagerDeltaClear(Pager *pPager){
+  PagerDelta *p, *pNext;
+  for(p=pPager->pDeltaList; p; p=pNext){
+    pNext = p->pNext;
+    sqlite3_free(p);
+  }
+  pPager->pDeltaList = 0;
+  pPager->iDeltaGen++;
 }
 #endif /* SQLITE_OMIT_WAL */
 
@@ -3499,7 +3457,6 @@ static int pagerWalFrames(
   pPager->aStat[PAGER_STAT_WRITE] += nList;
 
   if( pList->pgno==1 ) pager_write_changecounter(pList);
-  if( pagerPlogEnabled() ) pagerPreImageDiff(pPager, pList, isCommit);
   rc = pPager->wal->methods.xFrames(pPager->wal->pData,
       pPager->pageSize, pList, nTruncate, isCommit, pPager->walSyncFlags, NULL
   );
@@ -4501,7 +4458,7 @@ int sqlite3PagerClose(Pager *pPager, sqlite3 *db){
   sqlite3OsClose(pPager->jfd);
   sqlite3OsClose(pPager->fd);
   sqlite3PageFree(pTmp);
-  pagerPreImageClear(pPager);
+  pagerDeltaClear(pPager);
   sqlite3PcacheClose(pPager->pPCache);
   assert( !pPager->aSavepoint && !pPager->pInJournal );
   assert( !isOpen(pPager->jfd) && !isOpen(pPager->sjfd) );
@@ -6402,7 +6359,6 @@ static int pager_write(PgHdr *pPg){
   ** after the page has been successfully journalled, before setting the
   ** PGHDR_WRITEABLE bit that indicates that the page can be safely modified.
   */
-  pagerPreImageTake(pPager, pPg);   /* content is still unmodified here */
   pPg->flags |= PGHDR_WRITEABLE;
  
   /* If the statement journal is open and the page is not in it,
@@ -6524,7 +6480,7 @@ static SQLITE_NOINLINE int pagerWriteLargeSector(PgHdr *pPg){
 ** If an error occurs, SQLITE_NOMEM or an IO error code is returned
 ** as appropriate. Otherwise, SQLITE_OK.
 */
-int sqlite3PagerWrite(PgHdr *pPg){
+static int pagerWriteImpl(PgHdr *pPg){
   Pager *pPager = pPg->pPager;
   assert( (pPg->flags & PGHDR_MMAP)==0 );
   assert( pPager->eState>=PAGER_WRITER_LOCKED );
@@ -6540,6 +6496,32 @@ int sqlite3PagerWrite(PgHdr *pPg){
   }else{
     return pager_write(pPg);
   }
+}
+
+/*
+** Mark pPg writeable without saying which bytes will change, so the log has
+** to carry the whole page.  This is the safe default and every caller that
+** cannot describe its write uses it.
+*/
+int sqlite3PagerWrite(PgHdr *pPg){
+  int rc = pagerWriteImpl(pPg);
+  if( rc==SQLITE_OK ) pagerDeltaWhole(pPg->pPager, pPg);
+  return rc;
+}
+
+/*
+** As sqlite3PagerWrite(), but the caller states that only
+** [iOff, iOff+nByte) of the page is about to change, so the log can carry
+** just those bytes.  Declaring too little would lose a change, so a caller
+** must cover everything it writes; declaring too much only costs bytes.
+**
+** A page that also goes through sqlite3PagerWrite() at any point in the
+** transaction stays whole, whatever is declared here.
+*/
+int sqlite3PagerWriteRange(PgHdr *pPg, int iOff, int nByte){
+  int rc = pagerWriteImpl(pPg);
+  if( rc==SQLITE_OK ) pagerDeltaRange(pPg->pPager, pPg, iOff, nByte);
+  return rc;
 }
 
 /*
