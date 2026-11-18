@@ -432,6 +432,10 @@ int edgeMetadataSize(int nFormatVersion){
 }
 
 int nodeEdgeOverhead(int nFormatVersion, int nEdgeVectorSize){
+  /* From v4 the neighbour's vector is not in the block, only its metadata. */
+  if( VECTOR_FORMAT_SPLIT_CVEC(nFormatVersion) ){
+    return edgeMetadataSize(nFormatVersion);
+  }
   return nEdgeVectorSize + edgeMetadataSize(nFormatVersion);
 }
 
@@ -448,7 +452,10 @@ int nodeEdgesMaxCount(const DiskAnnIndex *pIndex){
 int nodeEdgesMetadataOffset(const DiskAnnIndex *pIndex){
   unsigned int offset;
   unsigned int nMaxEdges = nodeEdgesMaxCount(pIndex);
-  offset = nodeMetadataSize(pIndex->nFormatVersion) + pIndex->nNodeVectorSize + nMaxEdges * pIndex->nEdgeVectorSize;
+  offset = nodeMetadataSize(pIndex->nFormatVersion) + pIndex->nNodeVectorSize;
+  if( !VECTOR_FORMAT_SPLIT_CVEC(pIndex->nFormatVersion) ){
+    offset += nMaxEdges * pIndex->nEdgeVectorSize;
+  }
   assert( offset <= pIndex->nBlockSize );
   return offset;
 }
@@ -475,35 +482,162 @@ u16 nodeBinEdges(const DiskAnnIndex *pIndex, const BlobSpot *pBlobSpot) {
   return readLE16(pBlobSpot->pBuffer + sizeof(u64));
 }
 
-void nodeBinEdge(const DiskAnnIndex *pIndex, const BlobSpot *pBlobSpot, int iEdge, u64 *pRowid, float *pDistance, Vector *pVector) {
+/*
+** Read nRowid's own vector, in the edge representation, out of the side
+** table into pBuf (nEdgeVectorSize bytes).  Only meaningful from v4.
+**
+** The blob handle is kept on the index and reopened, the way BlobSpot does
+** it, because a search touches one of these per edge it considers.
+*/
+static int cvecRead(DiskAnnIndex *pIndex, u64 nRowid, u8 *pBuf){
+  int rc;
+  assert( VECTOR_FORMAT_SPLIT_CVEC(pIndex->nFormatVersion) );
+
+  if( pIndex->pCVecBlob != NULL ){
+    rc = sqlite3_blob_reopen(pIndex->pCVecBlob, nRowid);
+    if( rc != SQLITE_OK ){
+      /* A failed reopen poisons the handle - every later call on it returns
+      ** SQLITE_ABORT - so drop it and open a fresh one below. */
+      sqlite3_blob_close(pIndex->pCVecBlob);
+      pIndex->pCVecBlob = NULL;
+    }
+  }
+  if( pIndex->pCVecBlob == NULL ){
+    rc = sqlite3_blob_open(pIndex->db, pIndex->zDbSName, pIndex->zCVec, "data",
+                           nRowid, 0, &pIndex->pCVecBlob);
+    if( rc != SQLITE_OK ){
+      pIndex->pCVecBlob = NULL;
+      return rc == SQLITE_ERROR ? DISKANN_ROW_NOT_FOUND : rc;
+    }
+  }
+  rc = sqlite3_blob_read(pIndex->pCVecBlob, pBuf, pIndex->nEdgeVectorSize, 0);
+  if( rc != SQLITE_OK ){
+    return rc;
+  }
+  pIndex->nReads++;
+  DISKANN_STAT_READ(pIndex);
+  return SQLITE_OK;
+}
+
+/* Store nRowid's own vector in the edge representation.  Written once, when
+** the node is inserted; the vector never changes afterwards. */
+static int cvecWrite(DiskAnnIndex *pIndex, u64 nRowid, const Vector *pVector){
+  sqlite3_stmt *pStmt = NULL;
+  char *zSql;
+  u8 *pBuf = NULL;
+  int rc;
+
+  assert( VECTOR_FORMAT_SPLIT_CVEC(pIndex->nFormatVersion) );
+
+  zSql = sqlite3MPrintf(pIndex->db,
+    "INSERT OR REPLACE INTO \"%w\".%s(index_key, data) VALUES (?, ?)",
+    pIndex->zDbSName, pIndex->zCVec);
+  if( zSql == NULL ){
+    return SQLITE_NOMEM_BKPT;
+  }
+  pBuf = sqlite3_malloc(pIndex->nEdgeVectorSize);
+  if( pBuf == NULL ){
+    rc = SQLITE_NOMEM_BKPT;
+    goto out;
+  }
+  vectorSerializeToBlob(pVector, pBuf, pIndex->nEdgeVectorSize);
+
+  rc = sqlite3_prepare_v2(pIndex->db, zSql, -1, &pStmt, 0);
+  if( rc != SQLITE_OK ){
+    goto out;
+  }
+  rc = sqlite3_bind_int64(pStmt, 1, (sqlite3_int64)nRowid);
+  if( rc != SQLITE_OK ){
+    goto out;
+  }
+  rc = sqlite3_bind_blob(pStmt, 2, pBuf, pIndex->nEdgeVectorSize, SQLITE_STATIC);
+  if( rc != SQLITE_OK ){
+    goto out;
+  }
+  rc = sqlite3_step(pStmt) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
+  if( rc == SQLITE_OK ){
+    pIndex->nWrites++;
+  }
+out:
+  if( pStmt != NULL ){
+    sqlite3_finalize(pStmt);
+  }
+  sqlite3_free(pBuf);
+  sqlite3DbFree(pIndex->db, zSql);
+  return rc;
+}
+
+/* Drop nRowid's side-table row.  Called when the node goes away. */
+static int cvecDelete(DiskAnnIndex *pIndex, u64 nRowid){
+  sqlite3_stmt *pStmt = NULL;
+  char *zSql;
+  int rc;
+
+  assert( VECTOR_FORMAT_SPLIT_CVEC(pIndex->nFormatVersion) );
+
+  /* The read handle may be sitting on the row about to be deleted. */
+  if( pIndex->pCVecBlob != NULL ){
+    sqlite3_blob_close(pIndex->pCVecBlob);
+    pIndex->pCVecBlob = NULL;
+  }
+  zSql = sqlite3MPrintf(pIndex->db,
+    "DELETE FROM \"%w\".%s WHERE index_key = ?", pIndex->zDbSName, pIndex->zCVec);
+  if( zSql == NULL ){
+    return SQLITE_NOMEM_BKPT;
+  }
+  rc = sqlite3_prepare_v2(pIndex->db, zSql, -1, &pStmt, 0);
+  if( rc == SQLITE_OK ){
+    sqlite3_bind_int64(pStmt, 1, (sqlite3_int64)nRowid);
+    rc = sqlite3_step(pStmt) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
+  }
+  if( pStmt != NULL ){
+    sqlite3_finalize(pStmt);
+  }
+  sqlite3DbFree(pIndex->db, zSql);
+  return rc;
+}
+
+int nodeBinEdge(DiskAnnIndex *pIndex, const BlobSpot *pBlobSpot, int iEdge, u64 *pRowid, float *pDistance, u8 *pScratch, Vector *pVector) {
   u32 distance;
   int offset = nodeEdgesMetadataOffset(pIndex);
+  u64 nEdgeRowid;
 
+  assert( offset + (iEdge + 1) * edgeMetadataSize(pIndex->nFormatVersion) <= pBlobSpot->nBufferSize );
+  nEdgeRowid = readLE64(pBlobSpot->pBuffer + offset + iEdge * edgeMetadataSize(pIndex->nFormatVersion) + sizeof(u64));
   if( pRowid != NULL ){
-    assert( offset + (iEdge + 1) * edgeMetadataSize(pIndex->nFormatVersion) <= pBlobSpot->nBufferSize );
-    *pRowid = readLE64(pBlobSpot->pBuffer + offset + iEdge * edgeMetadataSize(pIndex->nFormatVersion) + sizeof(u64));
+    *pRowid = nEdgeRowid;
   }
   if( pIndex->nFormatVersion != VECTOR_FORMAT_V1 && pDistance != NULL ){
     distance = readLE32(pBlobSpot->pBuffer + offset + iEdge * edgeMetadataSize(pIndex->nFormatVersion) + sizeof(u32));
     *pDistance = *((float*)&distance);
   }
-  if( pVector != NULL ){
-    assert( nodeMetadataSize(pIndex->nFormatVersion) + pIndex->nNodeVectorSize + iEdge * pIndex->nEdgeVectorSize < offset );
-    vectorInitStatic(
-      pVector,
-      pIndex->nEdgeVectorType,
-      pIndex->nVectorDims,
-      pBlobSpot->pBuffer + nodeMetadataSize(pIndex->nFormatVersion) + pIndex->nNodeVectorSize + iEdge * pIndex->nEdgeVectorSize
-    );
+  if( pVector == NULL || pScratch == NULL ){
+    return SQLITE_OK;
   }
+  if( VECTOR_FORMAT_SPLIT_CVEC(pIndex->nFormatVersion) ){
+    int rc = cvecRead(pIndex, nEdgeRowid, pScratch);
+    if( rc != SQLITE_OK ){
+      return rc;
+    }
+    vectorInitStatic(pVector, pIndex->nEdgeVectorType, pIndex->nVectorDims, pScratch);
+    return SQLITE_OK;
+  }
+  assert( nodeMetadataSize(pIndex->nFormatVersion) + pIndex->nNodeVectorSize + iEdge * pIndex->nEdgeVectorSize < offset );
+  vectorInitStatic(
+    pVector,
+    pIndex->nEdgeVectorType,
+    pIndex->nVectorDims,
+    pBlobSpot->pBuffer + nodeMetadataSize(pIndex->nFormatVersion) + pIndex->nNodeVectorSize + iEdge * pIndex->nEdgeVectorSize
+  );
+  return SQLITE_OK;
 }
 
-int nodeBinEdgeFindIdx(const DiskAnnIndex *pIndex, const BlobSpot *pBlobSpot, u64 nRowid) {
+int nodeBinEdgeFindIdx(DiskAnnIndex *pIndex, const BlobSpot *pBlobSpot, u64 nRowid) {
   int i, nEdges = nodeBinEdges(pIndex, pBlobSpot);
   // todo: if edges will be sorted by identifiers we can use binary search here (although speed up will be visible only on pretty loaded nodes: >128 edges)
   for(i = 0; i < nEdges; i++){
     u64 edgeId;
-    nodeBinEdge(pIndex, pBlobSpot, i, &edgeId, NULL, NULL);
+    nodeBinEdge(pIndex, pBlobSpot, i, &edgeId, NULL, NULL, NULL);
     if( edgeId == nRowid ){
       return i;
     }
@@ -533,10 +667,14 @@ void nodeBinReplaceEdge(const DiskAnnIndex *pIndex, BlobSpot *pBlobSpot, int iRe
   edgeVectorOffset = nodeMetadataSize(pIndex->nFormatVersion) + pIndex->nNodeVectorSize + iReplace * pIndex->nEdgeVectorSize;
   edgeMetaOffset = nodeEdgesMetadataOffset(pIndex) + iReplace * edgeMetadataSize(pIndex->nFormatVersion);
 
-  assert( edgeVectorOffset + pIndex->nEdgeVectorSize <= pBlobSpot->nBufferSize );
   assert( edgeMetaOffset + edgeMetadataSize(pIndex->nFormatVersion) <= pBlobSpot->nBufferSize );
 
-  vectorSerializeToBlob(pVector, pBlobSpot->pBuffer + edgeVectorOffset, pIndex->nEdgeVectorSize);
+  /* From v4 the neighbour's vector is already in the side table, written when
+  ** that node was inserted, so only the metadata below is touched here. */
+  if( !VECTOR_FORMAT_SPLIT_CVEC(pIndex->nFormatVersion) ){
+    assert( edgeVectorOffset + pIndex->nEdgeVectorSize <= pBlobSpot->nBufferSize );
+    vectorSerializeToBlob(pVector, pBlobSpot->pBuffer + edgeVectorOffset, pIndex->nEdgeVectorSize);
+  }
   writeLE32(pBlobSpot->pBuffer + edgeMetaOffset + sizeof(u32), *((u32*)&distance));
   writeLE64(pBlobSpot->pBuffer + edgeMetaOffset + sizeof(u64), nRowid);
 
@@ -554,6 +692,17 @@ void nodeBinDeleteEdge(const DiskAnnIndex *pIndex, BlobSpot *pBlobSpot, int iDel
   lastVectorOffset = nodeMetadataSize(pIndex->nFormatVersion) + pIndex->nNodeVectorSize + (nEdges - 1) * pIndex->nEdgeVectorSize;
   edgeMetaOffset = nodeEdgesMetadataOffset(pIndex) + iDelete * edgeMetadataSize(pIndex->nFormatVersion);
   lastMetaOffset = nodeEdgesMetadataOffset(pIndex) + (nEdges - 1) * edgeMetadataSize(pIndex->nFormatVersion);
+
+  /* From v4 there is no vector array in the block.  The offsets computed
+  ** above would land inside the metadata, so move only the metadata here. */
+  if( VECTOR_FORMAT_SPLIT_CVEC(pIndex->nFormatVersion) ){
+    assert( lastMetaOffset + edgeMetadataSize(pIndex->nFormatVersion) <= pBlobSpot->nBufferSize );
+    if( iDelete < nEdges - 1 ){
+      memmove(pBlobSpot->pBuffer + edgeMetaOffset, pBlobSpot->pBuffer + lastMetaOffset, edgeMetadataSize(pIndex->nFormatVersion));
+    }
+    writeLE16(pBlobSpot->pBuffer + sizeof(u64), nEdges - 1);
+    return;
+  }
 
   assert( edgeVectorOffset + pIndex->nEdgeVectorSize <= pBlobSpot->nBufferSize );
   assert( lastVectorOffset + pIndex->nEdgeVectorSize <= pBlobSpot->nBufferSize );
@@ -583,7 +732,7 @@ void nodeBinDebug(const DiskAnnIndex *pIndex, const BlobSpot *pBlobSpot) {
   DiskAnnTrace(("  nEdges=%d, nMaxEdges=%d, vector=", nEdges, nMaxEdges));
   vectorDump(&vector);
   for(i = 0; i < nEdges; i++){
-    nodeBinEdge(pIndex, pBlobSpot, i, &nRowid, &distance, &vector);
+    nodeBinEdge(pIndex, pBlobSpot, i, &nRowid, &distance, pIndex->aEdgeScratch[0], &vector);
     DiskAnnTrace(("  to=%lld, distance=%f, vector=", nRowid, distance));
     vectorDump(&vector);
   }
@@ -594,6 +743,23 @@ void nodeBinDebug(const DiskAnnIndex *pIndex, const BlobSpot *pBlobSpot) {
 ** DiskANN shadow index operations (some of them exposed as DiskANN internal API)
 ********************************************************************************/
 
+/*
+** LIBSQL_DISKANN_SPLIT_CVEC=1 builds new indexes in v4, which keeps the
+** neighbour vectors in a side table instead of copying one into the block of
+** every node that points at them.  Off by default so that the two layouts can
+** be measured against each other; existing indexes keep their own format
+** either way, since the format is recorded per index at creation.
+*/
+static int diskAnnSplitCVecState = 0;   /* 0 unread, 1 on, 2 off */
+
+static int diskAnnSplitCVec(void){
+  if( diskAnnSplitCVecState == 0 ){
+    const char *z = getenv("LIBSQL_DISKANN_SPLIT_CVEC");
+    diskAnnSplitCVecState = (z != 0 && z[0] != 0 && z[0] != '0') ? 1 : 2;
+  }
+  return diskAnnSplitCVecState == 1;
+}
+
 int diskAnnCreateIndex(
   sqlite3 *db,
   const char *zDbSName,
@@ -603,7 +769,7 @@ int diskAnnCreateIndex(
   const char **pzErrMsg
 ){
   int rc;
-  int type, dims, metric, neighbours;
+  int type, dims, metric, neighbours, formatVersion;
   u64 maxNeighborsParam, blockSizeBytes;
   char *zSql;
   const char *zRowidColumnName;
@@ -617,6 +783,16 @@ int diskAnnCreateIndex(
   }
   if( vectorIdxParamsPutU64(pParams, VECTOR_INDEX_TYPE_PARAM_ID, VECTOR_INDEX_TYPE_DISKANN) != 0 ){
     return SQLITE_ERROR;
+  }
+  formatVersion = (int)vectorIdxParamsGetU64(pParams, VECTOR_FORMAT_PARAM_ID);
+  if( formatVersion == 0 ){
+    formatVersion = VECTOR_FORMAT_DEFAULT;
+  }
+  if( diskAnnSplitCVec() && formatVersion < VECTOR_FORMAT_V4 ){
+    formatVersion = VECTOR_FORMAT_V4;
+    if( vectorIdxParamsPutU64(pParams, VECTOR_FORMAT_PARAM_ID, formatVersion) != 0 ){
+      return SQLITE_ERROR;
+    }
   }
   type = vectorIdxParamsGetU64(pParams, VECTOR_TYPE_PARAM_ID);
   if( type == 0 ){
@@ -648,9 +824,16 @@ int diskAnnCreateIndex(
   if( maxNeighborsParam == 0 ){
     // 3 D**(1/2) gives good recall values (90%+)
     // we also want to keep disk overhead at moderate level - 50x of the disk size increase is the current upper bound
-    maxNeighborsParam = MIN(3 * ((int)(sqrt(dims)) + 1), (50 * nodeOverhead(VECTOR_FORMAT_DEFAULT, vectorDataSize(type, dims))) / nodeEdgeOverhead(VECTOR_FORMAT_DEFAULT, vectorDataSize(neighbours, dims)) + 1);
+    //
+    // this cap is deliberately computed with the v3 edge overhead even when
+    // the index is built as v4.  v4 blocks are far smaller, so the cap would
+    // otherwise let in many more neighbours and the two formats would differ
+    // in graph shape as well as in storage - which would make it impossible
+    // to attribute a size or recall change to the split alone.  Pass
+    // max_neighbors explicitly to spend the room v4 frees up.
+    maxNeighborsParam = MIN(3 * ((int)(sqrt(dims)) + 1), (50 * nodeOverhead(VECTOR_FORMAT_DEFAULT, vectorDataSize(type, dims))) / nodeEdgeOverhead(VECTOR_FORMAT_V3, vectorDataSize(neighbours, dims)) + 1);
   }
-  blockSizeBytes = nodeOverhead(VECTOR_FORMAT_DEFAULT, vectorDataSize(type, dims)) + maxNeighborsParam * (u64)nodeEdgeOverhead(VECTOR_FORMAT_DEFAULT, vectorDataSize(neighbours, dims));
+  blockSizeBytes = nodeOverhead(formatVersion, vectorDataSize(type, dims)) + maxNeighborsParam * (u64)nodeEdgeOverhead(formatVersion, vectorDataSize(neighbours, dims));
   if( blockSizeBytes > DISKANN_MAX_BLOCK_SZ ){
     return SQLITE_ERROR;
   }
@@ -721,6 +904,23 @@ int diskAnnCreateIndex(
   );
   rc = sqlite3_exec(db, zSql, 0, 0, 0);
   sqlite3DbFree(db, zSql);
+  if( rc != SQLITE_OK ){
+    return rc;
+  }
+
+  /*
+  ** The v4 side table, holding one neighbour vector per node.  It is created
+  ** unconditionally so that the two formats share a shape and an index built
+  ** in either can be dropped the same way; in v1-v3 it simply stays empty.
+  */
+  zSql = sqlite3MPrintf(
+      db,
+      "CREATE TABLE IF NOT EXISTS \"%w\".%s_cvecshadow (index_key INTEGER PRIMARY KEY, data BLOB)",
+      zDbSName,
+      zIdxName
+  );
+  rc = sqlite3_exec(db, zSql, 0, 0, 0);
+  sqlite3DbFree(db, zSql);
   return rc;
 }
 
@@ -728,12 +928,25 @@ int diskAnnClearIndex(sqlite3 *db, const char *zDbSName, const char *zIdxName) {
   char *zSql = sqlite3MPrintf(db, "DELETE FROM \"%w\".%s_shadow", zDbSName, zIdxName);
   int rc = sqlite3_exec(db, zSql, 0, 0, 0);
   sqlite3DbFree(db, zSql);
-  return rc;
+  if( rc != SQLITE_OK ){
+    return rc;
+  }
+  zSql = sqlite3MPrintf(db, "DELETE FROM \"%w\".%s_cvecshadow", zDbSName, zIdxName);
+  rc = sqlite3_exec(db, zSql, 0, 0, 0);
+  sqlite3DbFree(db, zSql);
+  /* Indexes created before v4 have no side table; that is not a failure. */
+  return rc == SQLITE_ERROR ? SQLITE_OK : rc;
 }
 
 int diskAnnDropIndex(sqlite3 *db, const char *zDbSName, const char *zIdxName){
-  char *zSql = sqlite3MPrintf(db, "DROP TABLE \"%w\".%s_shadow", zDbSName, zIdxName);
+  char *zSql = sqlite3MPrintf(db, "DROP TABLE IF EXISTS \"%w\".%s_cvecshadow", zDbSName, zIdxName);
   int rc = sqlite3_exec(db, zSql, 0, 0, 0);
+  sqlite3DbFree(db, zSql);
+  if( rc != SQLITE_OK ){
+    return rc;
+  }
+  zSql = sqlite3MPrintf(db, "DROP TABLE \"%w\".%s_shadow", zDbSName, zIdxName);
+  rc = sqlite3_exec(db, zSql, 0, 0, 0);
   sqlite3DbFree(db, zSql);
   return rc;
 }
@@ -1327,7 +1540,7 @@ static int diskAnnSearchCtxFindClosestCandidateIdx(const DiskAnnSearchCtx *pCtx)
 // we also check that no current edge(B) will "prune" new vertex: i.e. dist(B, C) >= (means worse than) alpha * dist(node, C) for all current edges
 // if any edge(B) will "prune" new edge(C) we will ignore it (return -1)
 static int diskAnnReplaceEdgeIdx(
-  const DiskAnnIndex *pIndex,
+  DiskAnnIndex *pIndex,
   BlobSpot *pNodeBlob,
   u64 newRowid,
   VectorPair *pNewVector,
@@ -1351,7 +1564,10 @@ static int diskAnnReplaceEdgeIdx(
     u64 edgeRowid;
     float edgeToNew, nodeToEdge;
 
-    nodeBinEdge(pIndex, pNodeBlob, i, &edgeRowid, &nodeToEdge, &edgeVector);
+    if( nodeBinEdge(pIndex, pNodeBlob, i, &edgeRowid, &nodeToEdge, pIndex->aEdgeScratch[0], &edgeVector)!=SQLITE_OK ){
+      /* v4: the side-table row is gone, so this edge cannot be compared. */
+      continue;
+    }
     if( edgeRowid == newRowid ){
       // deletes can leave "zombie" edges in the graph and we must override them and not store duplicate edges in the node
       return i;
@@ -1379,7 +1595,7 @@ static int diskAnnReplaceEdgeIdx(
 // prune edges after we inserted new edge at position iInserted
 // we only need to check for edges which will be pruned by new vertex
 // no need to check for other pairs as we checked them on previous insertions
-static void diskAnnPruneEdges(const DiskAnnIndex *pIndex, BlobSpot *pNodeBlob, int iInserted, VectorPair *pPlaceholder) {
+static void diskAnnPruneEdges(DiskAnnIndex *pIndex, BlobSpot *pNodeBlob, int iInserted, VectorPair *pPlaceholder) {
   int i, s, nEdges;
   Vector nodeVector, hintEdgeVector;
   u64 hintRowid;
@@ -1396,7 +1612,9 @@ static void diskAnnPruneEdges(const DiskAnnIndex *pIndex, BlobSpot *pNodeBlob, i
   nodeBinDebug(pIndex, pNodeBlob);
 #endif
 
-  nodeBinEdge(pIndex, pNodeBlob, iInserted, &hintRowid, NULL, &hintEdgeVector);
+  if( nodeBinEdge(pIndex, pNodeBlob, iInserted, &hintRowid, NULL, pIndex->aEdgeScratch[1], &hintEdgeVector)!=SQLITE_OK ){
+    return;
+  }
 
   // remove edges which is no longer interesting due to the addition of iInserted
   i = 0;
@@ -1404,7 +1622,10 @@ static void diskAnnPruneEdges(const DiskAnnIndex *pIndex, BlobSpot *pNodeBlob, i
     Vector edgeVector;
     float nodeToEdge, hintToEdge;
     u64 edgeRowid;
-    nodeBinEdge(pIndex, pNodeBlob, i, &edgeRowid, &nodeToEdge, &edgeVector);
+    if( nodeBinEdge(pIndex, pNodeBlob, i, &edgeRowid, &nodeToEdge, pIndex->aEdgeScratch[0], &edgeVector)!=SQLITE_OK ){
+      i++;
+      continue;
+    }
 
     if( hintRowid == edgeRowid ){
       i++;
@@ -1528,7 +1749,9 @@ static int diskAnnSearchInternal(DiskAnnIndex *pIndex, DiskAnnSearchCtx *pCtx, u
       float edgeDistance;
       int iInsert;
       DiskAnnNode *pNewCandidate;
-      nodeBinEdge(pIndex, pCandidateBlob, i, &edgeRowid, NULL, &edgeVector);
+      if( nodeBinEdge(pIndex, pCandidateBlob, i, &edgeRowid, NULL, pIndex->aEdgeScratch[0], &edgeVector)!=SQLITE_OK ){
+        continue;
+      }
       if( diskAnnSearchCtxIsVisited(pCtx, edgeRowid) || diskAnnSearchCtxHasCandidate(pCtx, edgeRowid) ){
         continue;
       }
@@ -1716,6 +1939,23 @@ int diskAnnInsert(
   }
   nodeBinInit(pIndex, pBlobSpot, nNewRowid, pVectorInRow->pVector);
 
+  /* In v4 nobody copies this vector into their own block any more, so the one
+  ** authoritative copy in the edge representation is written here, once.  It
+  ** has to land before any back-edge is added, because the nodes taking those
+  ** back-edges read it straight back out.
+  **
+  ** vInsert only holds the new vector from the second pass onwards - the
+  ** first pass borrows it as scratch - so load it here and let that pass
+  ** clobber it as before. */
+  if( VECTOR_FORMAT_SPLIT_CVEC(pIndex->nFormatVersion) ){
+    loadVectorPair(&vInsert, pVectorInRow->pVector);
+    rc = cvecWrite(pIndex, nNewRowid, vInsert.pEdge);
+    if( rc != SQLITE_OK ){
+      *pzErrMsg = sqlite3_mprintf("vector index(insert): failed to write neighbour vector");
+      goto out;
+    }
+  }
+
   if( first ){
     DiskAnnTrace(("inserted first row\n"));
     rc = SQLITE_OK;
@@ -1821,7 +2061,7 @@ int diskAnnDelete(
   nNeighbours = nodeBinEdges(pIndex, pNodeBlob);
   for(i = 0; i < nNeighbours; i++){
     u64 edgeRowid;
-    nodeBinEdge(pIndex, pNodeBlob, i, &edgeRowid, NULL, NULL);
+    nodeBinEdge(pIndex, pNodeBlob, i, &edgeRowid, NULL, NULL, NULL);
     rc = blobSpotReload(pIndex, pEdgeBlob, edgeRowid, pIndex->nBlockSize);
     if( rc == DISKANN_ROW_NOT_FOUND ){
       continue;
@@ -1845,6 +2085,14 @@ int diskAnnDelete(
   if( rc != SQLITE_OK ){
     *pzErrMsg = sqlite3_mprintf("vector index(delete): failed to remove shadow row");
     goto out;
+  }
+
+  if( VECTOR_FORMAT_SPLIT_CVEC(pIndex->nFormatVersion) ){
+    rc = cvecDelete(pIndex, nodeRowid);
+    if( rc != SQLITE_OK ){
+      *pzErrMsg = sqlite3_mprintf("vector index(delete): failed to remove neighbour vector");
+      goto out;
+    }
   }
 
   rc = SQLITE_OK;
@@ -1877,7 +2125,11 @@ int diskAnnOpenIndex(
   pIndex->zDbSName = sqlite3DbStrDup(db, zDbSName);
   pIndex->zName = sqlite3DbStrDup(db, zIdxName);
   pIndex->zShadow = sqlite3MPrintf(db, "%s_shadow", zIdxName);
-  if( pIndex->zShadow == NULL ){
+  pIndex->zCVec = sqlite3MPrintf(db, "%s_cvecshadow", zIdxName);
+  pIndex->pCVecBlob = NULL;
+  pIndex->aEdgeScratch[0] = NULL;
+  pIndex->aEdgeScratch[1] = NULL;
+  if( pIndex->zShadow == NULL || pIndex->zCVec == NULL ){
     diskAnnCloseIndex(pIndex);
     return SQLITE_NOMEM_BKPT;
   }
@@ -1925,12 +2177,29 @@ int diskAnnOpenIndex(
     pIndex->nEdgeVectorSize = vectorDataSize(compressNeighbours, pIndex->nVectorDims);
   }
 
+  /* v4 hands neighbour vectors back out of the side table, so nodeBinEdge()
+  ** needs somewhere to put them.  Two, because pruning holds one neighbour's
+  ** vector while walking the others. */
+  if( VECTOR_FORMAT_SPLIT_CVEC(pIndex->nFormatVersion) ){
+    pIndex->aEdgeScratch[0] = sqlite3_malloc(pIndex->nEdgeVectorSize);
+    pIndex->aEdgeScratch[1] = sqlite3_malloc(pIndex->nEdgeVectorSize);
+    if( pIndex->aEdgeScratch[0] == NULL || pIndex->aEdgeScratch[1] == NULL ){
+      diskAnnCloseIndex(pIndex);
+      return SQLITE_NOMEM_BKPT;
+    }
+  }
+
   *ppIndex = pIndex;
   DiskAnnTrace(("opened index %s: max edges %d\n", zIdxName, nodeEdgesMaxCount(pIndex)));
   return SQLITE_OK;
 }
 
 void diskAnnCloseIndex(DiskAnnIndex *pIndex){
+  if( pIndex->pCVecBlob ){
+    sqlite3_blob_close(pIndex->pCVecBlob);
+  }
+  sqlite3_free(pIndex->aEdgeScratch[0]);
+  sqlite3_free(pIndex->aEdgeScratch[1]);
   if( pIndex->zDbSName ){
     sqlite3DbFree(pIndex->db, pIndex->zDbSName);
   }
@@ -1939,6 +2208,9 @@ void diskAnnCloseIndex(DiskAnnIndex *pIndex){
   }
   if( pIndex->zShadow ){
     sqlite3DbFree(pIndex->db, pIndex->zShadow);
+  }
+  if( pIndex->zCVec ){
+    sqlite3DbFree(pIndex->db, pIndex->zCVec);
   }
   sqlite3DbFree(pIndex->db, pIndex);
 }

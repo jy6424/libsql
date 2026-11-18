@@ -19,6 +19,9 @@ struct DiskAnnIndex {
   char *zDbSName;      /* Database name */
   char *zName;         /* Index name */
   char *zShadow;       /* Shadow table name */
+  char *zCVec;         /* Side table holding one neighbour vector per node (v4+) */
+  sqlite3_blob *pCVecBlob;  /* Reusable read handle into zCVec; NULL until used */
+  u8 *aEdgeScratch[2]; /* Buffers nodeBinEdge() reads neighbour vectors into */
   int nFormatVersion;  /* DiskAnn format version */
   int nDistanceFunc;   /* Distance function */
   int nBlockSize;      /* Size of the block which stores all data for single node */
@@ -74,8 +77,17 @@ int nodeEdgesMetadataOffset(const DiskAnnIndex *pIndex);
 void nodeBinInit(const DiskAnnIndex *pIndex, BlobSpot *pBlobSpot, u64 nRowid, Vector *pVector);
 void nodeBinVector(const DiskAnnIndex *pIndex, const BlobSpot *pBlobSpot, Vector *pVector);
 u16 nodeBinEdges(const DiskAnnIndex *pIndex, const BlobSpot *pBlobSpot);
-void nodeBinEdge(const DiskAnnIndex *pIndex, const BlobSpot *pBlobSpot, int iEdge, u64 *pRowid, float *distance, Vector *pVector);
-int nodeBinEdgeFindIdx(const DiskAnnIndex *pIndex, const BlobSpot *pBlobSpot, u64 nRowid);
+/*
+** Read edge iEdge.  Any of pRowid/pDistance/pVector may be NULL.
+**
+** pVector is only filled when pScratch is given.  Up to v3 it points straight
+** into the block; from v4 the neighbour's vector is read out of the side
+** table into pScratch, which must hold nEdgeVectorSize bytes and stay alive
+** as long as pVector is used - pass pIndex->aEdgeScratch[0] or [1], using
+** different ones for vectors that must be live at the same time.
+*/
+int nodeBinEdge(DiskAnnIndex *pIndex, const BlobSpot *pBlobSpot, int iEdge, u64 *pRowid, float *distance, u8 *pScratch, Vector *pVector);
+int nodeBinEdgeFindIdx(DiskAnnIndex *pIndex, const BlobSpot *pBlobSpot, u64 nRowid);
 void nodeBinPruneEdges(const DiskAnnIndex *pIndex, BlobSpot *pBlobSpot, int nPruned);
 void nodeBinReplaceEdge(const DiskAnnIndex *pIndex, BlobSpot *pBlobSpot, int iReplace, u64 nRowid, float distance, Vector *pVector);
 void nodeBinDeleteEdge(const DiskAnnIndex *pIndex, BlobSpot *pBlobSpot, int iDelete);
@@ -106,10 +118,21 @@ typedef u8 MetricType;
  * 1 - v1 version; node block format: [node meta] [node vector] [edge vectors] ... [ [u64 unused               ] [u64 edge rowid] ] ...
  * 2 - v2 version; node block format: [node meta] [node vector] [edge vectors] ... [ [u32 unused] [f32 distance] [u64 edge rowid] ] ...
  * 3 - v3 version; node meta aligned to 8-byte boundary (instead of having u64 + u16 size - we round it up to u64 + u64)
+ * 4 - v4 version; neighbour vectors are no longer inlined in the node block.
+ *     Each node keeps one copy of its own vector in the edge representation
+ *     in a side table, and blocks hold only ids:
+ *       [node meta] [node vector] ... [ [u32 unused] [f32 distance] [u64 edge rowid] ] ...
+ *     In v1-v3 a vector is copied into the block of every node that lists it
+ *     as a neighbour, so it is stored in-degree times; here it is stored once.
 */
 #define VECTOR_FORMAT_V1                    1
 #define VECTOR_FORMAT_V2                    2
+#define VECTOR_FORMAT_V3                    3
+#define VECTOR_FORMAT_V4                    4
 #define VECTOR_FORMAT_DEFAULT               3
+
+/* True if neighbour vectors live in the side table rather than in the block. */
+#define VECTOR_FORMAT_SPLIT_CVEC(v)         ((v) >= VECTOR_FORMAT_V4)
 
 /* type of the vector index */
 #define VECTOR_INDEX_TYPE_PARAM_ID          2
