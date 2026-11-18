@@ -49,6 +49,9 @@
 
 #define EDGE_META_SIZE 16        /* [u32 unused][f32 distance][u64 edgeId] */
 
+/* From v4 the neighbour vectors are in <idx>_cvecshadow, not in the block. */
+#define IS_SPLIT(fmt) ((fmt) >= 4)
+
 typedef sqlite3_int64 i64;
 typedef unsigned char u8;
 
@@ -148,6 +151,7 @@ static int analyse(sqlite3 *db, const char *zIdx){
   int fmt, type, dims, nbType, nodeVec, edgeVec, nodeMeta;
   int nMaxEdge, metaOff, blockParam, blockReal = 0;
   i64 nNode = 0, nEdge = 0, i;
+  i64 nCVecRow = 0, nCVecByte = 0;
   i64 nDegHist[65];
   int mxDeg = 0;
 
@@ -199,8 +203,13 @@ static int analyse(sqlite3 *db, const char *zIdx){
     return 1;
   }
 
-  nMaxEdge = (blockReal - (nodeVec + nodeMeta)) / (edgeVec + EDGE_META_SIZE);
-  metaOff  = nodeMeta + nodeVec + nMaxEdge*edgeVec;
+  if( IS_SPLIT(fmt) ){
+    nMaxEdge = (blockReal - (nodeVec + nodeMeta)) / EDGE_META_SIZE;
+    metaOff  = nodeMeta + nodeVec;
+  }else{
+    nMaxEdge = (blockReal - (nodeVec + nodeMeta)) / (edgeVec + EDGE_META_SIZE);
+    metaOff  = nodeMeta + nodeVec + nMaxEdge*edgeVec;
+  }
 
   printf("index '%s'\n", zIdx);
   printf("  format v%d  dims %d  node %s (%d B)  neighbour %s (%d B)\n",
@@ -212,8 +221,20 @@ static int analyse(sqlite3 *db, const char *zIdx){
   }
   printf("\n");
   printf("  slots %d   layout: hdr %d | node vec %d | edge vecs %d | edge meta %d\n",
-         nMaxEdge, nodeMeta, nodeVec, nMaxEdge*edgeVec,
+         nMaxEdge, nodeMeta, nodeVec,
+         IS_SPLIT(fmt) ? 0 : nMaxEdge*edgeVec,
          nMaxEdge*EDGE_META_SIZE);
+  if( IS_SPLIT(fmt) ){
+    printf("  neighbour vectors are split out into %s_cvecshadow\n", zIdx);
+    sqlite3_snprintf(sizeof(zSql), zSql,
+      "SELECT count(*), total(length(data)) FROM \"%w_cvecshadow\"", zIdx);
+    if( sqlite3_prepare_v2(db, zSql, -1, &pStmt, 0)==SQLITE_OK
+     && sqlite3_step(pStmt)==SQLITE_ROW ){
+      nCVecRow  = sqlite3_column_int64(pStmt, 0);
+      nCVecByte = (i64)sqlite3_column_double(pStmt, 1);
+    }
+    sqlite3_finalize(pStmt);
+  }
 
   if( nMaxEdge<=0 || metaOff + nMaxEdge*EDGE_META_SIZE > blockReal ){
     fprintf(stderr, "  !! layout does not fit the block - constants have drifted\n");
@@ -313,14 +334,27 @@ static int analyse(sqlite3 *db, const char *zIdx){
     printf("\n");
 
     printf("\nneighbour-vector copies (%d B each)\n", edgeVec);
-    printf("  slots allocated : %lld  (%.1f MB)\n",
-           (long long)nAlloc, MB(nAlloc*(i64)edgeVec));
-    printf("  actually in use : %lld  (%.1f MB)\n",
-           (long long)nLive, MB(nLive*(i64)edgeVec));
-    printf("  needed if split : %lld  (%.1f MB)   one per node\n",
-           (long long)nNode, MB(nNode*(i64)edgeVec));
-    printf("  duplication     : %.1fx allocated, %.1fx live\n",
-           (double)nAlloc/(double)nNode, (double)nLive/(double)nNode);
+    if( IS_SPLIT(fmt) ){
+      printf("  stored in side table : %lld  (%.1f MB)   one per node\n",
+             (long long)nCVecRow, MB(nCVecByte));
+      printf("  v1-v3 would have had : %lld  (%.1f MB)\n",
+             (long long)nLive, MB(nLive*(i64)edgeVec));
+      printf("  duplication          : 1.0x  (was %.1fx)\n",
+             (double)nLive/(double)nNode);
+      if( nCVecRow!=nNode ){
+        printf("  !! %lld nodes but %lld side-table rows - they should match\n",
+               (long long)nNode, (long long)nCVecRow);
+      }
+    }else{
+      printf("  slots allocated : %lld  (%.1f MB)\n",
+             (long long)nAlloc, MB(nAlloc*(i64)edgeVec));
+      printf("  actually in use : %lld  (%.1f MB)\n",
+             (long long)nLive, MB(nLive*(i64)edgeVec));
+      printf("  needed if split : %lld  (%.1f MB)   one per node\n",
+             (long long)nNode, MB(nNode*(i64)edgeVec));
+      printf("  duplication     : %.1fx allocated, %.1fx live\n",
+             (double)nAlloc/(double)nNode, (double)nLive/(double)nNode);
+    }
   }
 
   /* ---- projection ---- */
@@ -332,6 +366,27 @@ static int analyse(sqlite3 *db, const char *zIdx){
     int id8 = 8, id4 = 4;
     i64 new8 = nNode*(i64)(nodeMeta + nodeVec + nMaxEdge*id8) + nNode*(i64)edgeVec;
     i64 new4 = nNode*(i64)(nodeMeta + nodeVec + nMaxEdge*id4) + nNode*(i64)edgeVec;
+
+    if( IS_SPLIT(fmt) ){
+      /* Already split: show what it cost and what it saved. */
+      i64 side = nCVecByte ? nCVecByte : nNode*(i64)edgeVec;
+      i64 tot = cur + side;
+      i64 asV3 = nNode*(i64)(nodeMeta + nodeVec
+                             + nMaxEdge*(edgeVec + EDGE_META_SIZE));
+      printf("\nindex size now: %.1f MB\n", MB(tot));
+      printf("  node blocks              : %7.1f MB  (%.1f%%)\n",
+             MB(cur), 100.0*cur/(double)tot);
+      printf("    node header + own vec  : %7.1f MB\n", MB(nodeRegion));
+      printf("    edge metadata          : %7.1f MB\n", MB(metaRegion));
+      printf("  neighbour vector table   : %7.1f MB  (%.1f%%)   one per node\n",
+             MB(side), 100.0*side/(double)tot);
+      printf("\nsame graph in the v1-v3 layout would be: %.1f MB   (%.2fx larger)\n",
+             MB(asV3), (double)asV3/(double)tot);
+      printf("\n  the node's own full vector is now %.0f%% of the index, and it\n"
+             "  is also in the base table - dropping it is the next lever.\n",
+             100.0*nodeRegion/(double)tot);
+      goto detail;
+    }
 
     printf("\nindex size now: %.1f MB\n", MB(cur));
     printf("  node header + own vector : %7.1f MB  (%.1f%%)\n",
@@ -353,6 +408,7 @@ static int analyse(sqlite3 *db, const char *zIdx){
            "  like for like.\n");
   }
 
+detail:
   /* Per-node detail, for looking at the distribution properly. */
   if( csvOut && aIn ){
     for(i=1; i<=mxRowid; i++){
