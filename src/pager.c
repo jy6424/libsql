@@ -3256,6 +3256,7 @@ static int pagerRollbackWal(Pager *pPager){
 ** LIBSQL_PLOG   enable
 */
 static int pagerPlogState = 0;        /* 0 unread, 1 on, 2 off */
+static int pagerPlogLsnState = 0;     /* 0 unread, 1 on, 2 off */
 
 static struct PagerPlogStat {
   u64 nPage;                  /* pages that declared anything */
@@ -3267,11 +3268,13 @@ static void pagerPlogReport(void){
   struct PagerPlogStat *p = &pagerPlogStat;
   if( p->nPage==0 ) return;
   fprintf(stderr,
-    "plog-decl: pages=%llu  ranges=%llu  whole=%llu (%.1f%%)  overflow=%llu\n",
+    "plog-decl: pages=%llu  ranges=%llu  whole=%llu (%.1f%%)  overflow=%llu"
+    "  lsn=%s\n",
     (unsigned long long)p->nPage,
     (unsigned long long)(p->nPage - p->nWhole),
     (unsigned long long)p->nWhole, 100.0*p->nWhole/(double)p->nPage,
-    (unsigned long long)p->nOverflow);
+    (unsigned long long)p->nOverflow,
+    pagerPlogLsnState==1 ? "on" : "off");
   fflush(stderr);
 }
 
@@ -3498,6 +3501,30 @@ static int pagerPlogEnabled(void){
 }
 
 /*
+** Bytes at the end of every page that hold the page LSN, when one is kept.
+** The same constant appears in plog.c, which stamps the slot; here it only
+** decides whether the database reserves enough room for it.
+*/
+#define PAGER_PLOG_LSN_SZ 8
+
+/*
+** True when a page LSN should be kept in each page's reserved bytes.
+**
+** A delta frame whose chain reaches back to the database file assumes that
+** file holds the exact version the delta was computed against.  Nothing
+** checks that today, so the assumption only holds for a single connection.
+** Stamping each page with the frame that last wrote it turns the assumption
+** into something the reader can verify - see plogReadPageContent().
+*/
+static int pagerPlogLsnEnabled(void){
+  if( pagerPlogLsnState==0 ){
+    const char *z = getenv("LIBSQL_PLOG_LSN");
+    pagerPlogLsnState = (z==0 || z[0]==0 || (z[0]=='0' && z[1]==0)) ? 2 : 1;
+  }
+  return pagerPlogLsnState==1;
+}
+
+/*
 ** Start pPg's range list for this transaction if it has not been touched yet.
 ** The generation stamp is what distinguishes that from a list left over from
 ** an earlier transaction, which must not be added to.
@@ -3637,6 +3664,22 @@ static int pagerWalFrames(
     ** page 1 has to reach the log whole. */
     pagerDeltaWhole(pPager, pList);
   }
+
+  /* Hand the log a slot to stamp a page LSN into.  Only the pager knows how
+  ** many bytes at the end of a page the btree layer left alone, so the slot
+  ** is declared here and the log is told it exists; the log fills it in.
+  ** Declaring it as a range is what carries the stamp into a delta frame and
+  ** from there into the database file at checkpoint. */
+  if( pagerPlogEnabled() && pagerPlogLsnEnabled()
+   && pPager->nReserve>=PAGER_PLOG_LSN_SZ
+  ){
+    for(p=pList; p; p=p->pDirty){
+      p->plogLsn = 1;
+      pagerDeltaRange(pPager, p, pPager->pageSize - PAGER_PLOG_LSN_SZ,
+                      PAGER_PLOG_LSN_SZ);
+    }
+  }
+
   rc = pPager->wal->methods.xFrames(pPager->wal->pData,
       pPager->pageSize, pList, nTruncate, isCommit, pPager->walSyncFlags, NULL
   );

@@ -523,8 +523,10 @@ struct PlogCkptInfo {
 **                             or 0 when this is the page's first one
 **   [36..37] u16 nChain       deltas on top of the base, this one included
 **   [38..39] u16 unused
+**   [40..43] u32 baseCkpt     log cycle of the database page this chain
+**   [44..47] u32 baseFrame    assumed as its base, or 0,0 for no claim
 **
-** The checksum covers bytes 0..7, then 24..40, then the whole body, so every
+** The checksum covers bytes 0..7, then 24..48, then the whole body, so every
 ** checksummed run stays a multiple of 8 as plogChecksumBytes() requires.
 ** The body is always nFrame-40 bytes: padding written to reach a sector
 ** boundary is part of it and is checksummed with it.
@@ -540,8 +542,21 @@ struct PlogCkptInfo {
 ** a checkpoint has to run to completion and reset the log before another
 ** connection reads the database - true for a single connection, not in
 ** general.
+**
+** baseCkpt/baseFrame is what makes that checkable rather than assumed.  When
+** the pager reserves room for it (LIBSQL_PLOG_LSN, see pager.c) every frame
+** stamps {nCkpt, its own frame number} into the last PLOG_LSN_SZ bytes of the
+** page, so the database file ends up carrying the frame that last wrote each
+** page.  A frame starting a chain records the stamp the page had before it,
+** and plogReadPageContent() refuses to apply the chain to a database page
+** that does not carry that stamp.  Zero means the frame makes no claim, which
+** is what a page that has never been stamped reads back as.
 */
-#define PLOG_FRAME_HDRSIZE 40
+#define PLOG_FRAME_HDRSIZE 48
+
+/* Bytes at the end of a page holding {u32 nCkpt, u32 iFrame}.  Kept in step
+** with PAGER_PLOG_LSN_SZ in pager.c, which reserves and declares the slot. */
+#define PLOG_LSN_SZ 8
 
 /*
 ** What this implementation actually wrote.  The prediction in pager.c is
@@ -1016,6 +1031,8 @@ static void plogEncodeFrame(
   u8 payloadType,                 /* PLOG_PT_* */
   u32 iPrev,                      /* Previous frame for this page, or 0 */
   u16 nChain,                     /* Deltas on top of the base */
+  u32 baseCkpt,                   /* Stamp the db page must carry, or 0 */
+  u32 baseFrame,                  /* ... see the frame format above */
   u8 *aBody,                      /* Body to be checksummed, or 0 */
   int nBody,                      /* Bytes of aBody; a multiple of 8 */
   int nPad,                       /* Zero bytes after it; a multiple of 8 */
@@ -1023,7 +1040,7 @@ static void plogEncodeFrame(
 ){
   int nativeCksum;                /* True for native byte-order checksums */
   u32 *aCksum = pWal->hdr.aFrameCksum;
-  assert( PLOG_FRAME_HDRSIZE==40 );
+  assert( PLOG_FRAME_HDRSIZE==48 );
   assert( nFrame>=PLOG_FRAME_HDRSIZE && (nFrame & 7)==0 );
   assert( (nBody & 7)==0 && (nPad & 7)==0 );
   assert( (u32)(PLOG_FRAME_HDRSIZE+nBody+nPad)==nFrame );
@@ -1039,11 +1056,13 @@ static void plogEncodeFrame(
   aFrame[37] = (u8)(nChain >> 8);
   aFrame[38] = 0;
   aFrame[39] = 0;
+  sqlite3Put4byte(&aFrame[40], baseCkpt);
+  sqlite3Put4byte(&aFrame[44], baseFrame);
   memcpy(&aFrame[8], pWal->hdr.aSalt, 8);
 
   nativeCksum = (pWal->hdr.bigEndCksum==SQLITE_BIGENDIAN);
   plogChecksumBytes(nativeCksum, aFrame, 8, aCksum, aCksum);
-  plogChecksumBytes(nativeCksum, &aFrame[24], 16, aCksum, aCksum);
+  plogChecksumBytes(nativeCksum, &aFrame[24], 24, aCksum, aCksum);
   if( nBody>0 ){
     plogChecksumBytes(nativeCksum, aBody, nBody, aCksum, aCksum);
   }
@@ -1085,7 +1104,7 @@ static int plogDecodeFrame(
   u32 *aCksum = pWal->hdr.aFrameCksum;
   u32 pgno;                       /* Page number of the frame */
   u32 nFrame;                     /* Declared length of the frame */
-  assert( PLOG_FRAME_HDRSIZE==40 );
+  assert( PLOG_FRAME_HDRSIZE==48 );
 
   /* A frame is only valid if it declares a sane length: the walk through the
   ** log depends on it, so a bad one has to stop recovery here. */
@@ -1115,7 +1134,7 @@ static int plogDecodeFrame(
   */
   nativeCksum = (pWal->hdr.bigEndCksum==SQLITE_BIGENDIAN);
   plogChecksumBytes(nativeCksum, aFrame, 8, aCksum, aCksum);
-  plogChecksumBytes(nativeCksum, &aFrame[24], 16, aCksum, aCksum);
+  plogChecksumBytes(nativeCksum, &aFrame[24], 24, aCksum, aCksum);
   if( nData>0 ){
     plogChecksumBytes(nativeCksum, aData, nData, aCksum, aCksum);
   }
@@ -3731,6 +3750,8 @@ static int plogReadPageContent(Wal *pWal, u32 iRead, int szPage, u8 *pOut){
   u32 i = iRead;
   u32 pgno = 0;
   u8 pt = PLOG_PT_FULL;
+  u32 baseCkpt = 0;             /* The stamp the chain's root expects the */
+  u32 baseFrame = 0;            /* ... database page to be carrying */
   int rc;
 
   while( i>0 ){
@@ -3744,6 +3765,10 @@ static int plogReadPageContent(Wal *pWal, u32 iRead, int szPage, u8 *pOut){
     aChain[n] = i;
     aRange[n] = (u16)(aHdr[28] | (aHdr[29]<<8));
     pt = aHdr[30];
+    /* The walk runs newest to oldest, so after the loop these hold the
+    ** oldest frame's claim - the one whose base is the database page. */
+    baseCkpt = sqlite3Get4byte(&aHdr[40]);
+    baseFrame = sqlite3Get4byte(&aHdr[44]);
     n++;
     if( pt==PLOG_PT_FULL ) break;
     i = sqlite3Get4byte(&aHdr[32]);
@@ -3762,6 +3787,20 @@ static int plogReadPageContent(Wal *pWal, u32 iRead, int szPage, u8 *pOut){
     rc = sqlite3OsRead(pWal->pDbFd, pOut, szPage, (i64)(pgno-1)*szPage);
     if( rc==SQLITE_IOERR_SHORT_READ ) rc = SQLITE_OK;
     if( rc!=SQLITE_OK ) return rc;
+
+    /* The deltas were computed against one particular version of that page.
+    ** When the chain says which, hold the database file to it: anything else
+    ** means some other writer moved the page on underneath this chain, and
+    ** applying the deltas would silently produce a page that never existed.
+    ** A zero claim is a frame written without page LSNs - nothing to check. */
+    if( (baseCkpt|baseFrame)!=0 && szPage>PLOG_LSN_SZ ){
+      u8 *aLsn = pOut + szPage - PLOG_LSN_SZ;
+      if( sqlite3Get4byte(&aLsn[0])!=baseCkpt
+       || sqlite3Get4byte(&aLsn[4])!=baseFrame
+      ){
+        return SQLITE_CORRUPT_BKPT;
+      }
+    }
   }
 
   while( --n >= 0 ){
@@ -4126,6 +4165,8 @@ static int plogWriteOneFrame(
   u8 payloadType,             /* PLOG_PT_* */
   u32 iPrev,                  /* Previous frame for this page, or 0 */
   u16 nChain,                 /* Deltas on top of the base */
+  u32 baseCkpt,               /* Stamp the db page must carry, or 0 */
+  u32 baseFrame,              /* ... see the frame format comment */
   u8 *aBody,                  /* Body bytes */
   int nBody                   /* Bytes of aBody; a multiple of 8 */
 ){
@@ -4134,7 +4175,8 @@ static int plogWriteOneFrame(
   u8 aFrame[PLOG_FRAME_HDRSIZE];   /* Buffer to assemble frame-header in */
 
   plogEncodeFrame(p->pWal, pgno, nTruncate, nFrame, nRange, payloadType,
-                  iPrev, nChain, aBody, nBody, nPad, aFrame);
+                  iPrev, nChain, baseCkpt, baseFrame, aBody, nBody, nPad,
+                  aFrame);
   rc = plogWriteToLog(p, aFrame, sizeof(aFrame), iOffset);
   if( rc ) return rc;
   if( nBody>0 ){
@@ -4298,6 +4340,23 @@ static int plogFrames(
     u8 *aBody;
     int nBody;
     u32 nFrame;
+    u32 baseCkpt = 0;             /* Stamp the page carried on the way in */
+    u32 baseFrame = 0;
+    u32 iThisFrame = iFrame+1;    /* Frame number this page is about to get */
+
+    /* Read the stamp the page arrived with, then replace it with this
+    ** frame's.  Reading first is what records which database version the
+    ** deltas below were computed against; the pager declared the slot as a
+    ** range, so writing into it here is what carries the new stamp into the
+    ** frame and, at checkpoint, into the database file.  The slot lives in
+    ** the page's reserved bytes, which the btree layer never touches. */
+    if( p->plogLsn && szPage>PLOG_LSN_SZ ){
+      u8 *aLsn = (u8*)p->pData + szPage - PLOG_LSN_SZ;
+      baseCkpt = sqlite3Get4byte(&aLsn[0]);
+      baseFrame = sqlite3Get4byte(&aLsn[4]);
+      sqlite3Put4byte(&aLsn[0], pWal->nCkpt);
+      sqlite3Put4byte(&aLsn[4], iThisFrame);
+    }
 
     /* Write only the bytes that changed, when the writer in btree.c declared
     ** them and this page's delta chain is still short enough that reading it
@@ -4368,8 +4427,9 @@ static int plogFrames(
     }
 
     iFrame++;
+    assert( iFrame==iThisFrame );
     rc = plogWriteOneFrame(&w, p->pgno, nDbSize, iOffset, nFrame, nRange, pt,
-                           iPrev, nChain, aBody, nBody);
+                           iPrev, nChain, baseCkpt, baseFrame, aBody, nBody);
     if( rc ) return rc;
     plogWriteStat.nFrame++;
     plogWriteStat.nByte += nFrame;
@@ -4915,7 +4975,7 @@ static int plogWalOpen(
   assert( 32768 ==  PLOGINDEX_PGSZ        );
   assert(     8 ==  SQLITE_SHM_NLOCK     );
   assert(     5 ==  PLOG_NREADER          );
-  assert(    40 ==  PLOG_FRAME_HDRSIZE    );
+  assert(    48 ==  PLOG_FRAME_HDRSIZE    );
   assert(    32 ==  PLOG_HDRSIZE          );
   assert(   120 ==  PLOGINDEX_LOCK_OFFSET + PLOG_WRITE_LOCK   );
   assert(   121 ==  PLOGINDEX_LOCK_OFFSET + PLOG_CKPT_LOCK    );

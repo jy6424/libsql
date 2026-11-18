@@ -32,6 +32,11 @@ struct libsql_pghdr {
   unsigned int plogGen;          /* Transaction these ranges describe */
   unsigned char plogWhole;       /* Log the whole page, ignore the ranges */
   unsigned char plogNRange;      /* Pairs in plogRange */
+  /* Set by the pager when the last 8 bytes of this page are reserved bytes
+  ** that the log may stamp with a page LSN, and are already declared as a
+  ** range.  The pager owns the knowledge of how many bytes are reserved; the
+  ** log only needs to be told that the slot is there.  See plogFrames(). */
+  unsigned char plogLsn;         /* Stamp a page LSN into the reserved bytes */
   unsigned short plogRange[2*8]; /* {offset, length} pairs */
 
   /**********************************************************************

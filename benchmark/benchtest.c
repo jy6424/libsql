@@ -86,6 +86,18 @@ int main(int argc, char* argv[]) {
   int rc = sqlite3_open(argv[2], &db);
   ensure(rc == 0, "failed to open db: rc=%d\n", rc);
   printf("open sqlite db at '%s'\n", argv[2]);
+
+  /* Page LSNs live in reserved bytes at the end of every page, so the room
+  ** has to be claimed before the database file takes shape.  Same env var the
+  ** pager reads, so the arms that do not want LSNs are untouched. */
+  if( getenv("LIBSQL_PLOG_LSN") != NULL && getenv("LIBSQL_PLOG_LSN")[0] != '0' ){
+    int nReserve = 8;
+    rc = sqlite3_file_control(db, "main", SQLITE_FCNTL_RESERVE_BYTES, &nReserve);
+    ensure(rc == 0, "failed to reserve bytes for page LSN: rc=%d\n", rc);
+    nReserve = -1;
+    sqlite3_file_control(db, "main", SQLITE_FCNTL_RESERVE_BYTES, &nReserve);
+    printf("page LSN on, reserved bytes = %d\n", nReserve);
+  }
   
   char line[65536 * 32];
   char template[65536 * 32];
@@ -93,8 +105,11 @@ int main(int argc, char* argv[]) {
   int parameter_lengths[16];
   int parameter_types[16];
 
-  sqlite3_stmt* statement;
+  /* Both are read before they are first written: prepared by the strcmp that
+  ** decides whether to re-prepare, statement by the finalize that follows. */
+  sqlite3_stmt* statement = NULL;
   char prepared[65536 * 32];
+  prepared[0] = '\0';
 
   double total_select_time = 0;
   double total_insert_time = 0;
@@ -223,6 +238,15 @@ int main(int argc, char* argv[]) {
     }
   }
 
-  sqlite3_close(db);
+  /* The last prepared statement is still live here - only a change of
+  ** template finalizes one.  sqlite3_close() returns SQLITE_BUSY and leaves
+  ** the connection open if any statement is outstanding, which skips the
+  ** closing checkpoint and leaves -wal and -shm behind. */
+  if (statement) {
+    sqlite3_finalize(statement);
+    statement = NULL;
+  }
+  rc = sqlite3_close(db);
+  ensure(rc == SQLITE_OK, "failed to close db: rc=%d: %s\n", rc, sqlite3_errmsg(db));
   return 0;
 }
