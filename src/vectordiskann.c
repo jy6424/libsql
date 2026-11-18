@@ -649,11 +649,16 @@ void nodeBinReplaceEdge(const DiskAnnIndex *pIndex, BlobSpot *pBlobSpot, int iRe
   int nMaxEdges = nodeEdgesMaxCount(pIndex);
   int nEdges = nodeBinEdges(pIndex, pBlobSpot);
   int edgeVectorOffset, edgeMetaOffset, itemsToMove;
+  /* A replacement leaves the count alone; only an append changes it.  The
+  ** count sits in the block header, which shares a page with the node's own
+  ** vector - cold data that nothing here touches - so writing it when it did
+  ** not change drags that page into every edge update. */
+  int isAppend = (iReplace == nEdges);
 
   assert( 0 <= iReplace && iReplace < nMaxEdges );
   assert( 0 <= iReplace && iReplace <= nEdges );
 
-  if( iReplace == nEdges ){
+  if( isAppend ){
     nEdges++;
   }
 
@@ -667,14 +672,16 @@ void nodeBinReplaceEdge(const DiskAnnIndex *pIndex, BlobSpot *pBlobSpot, int iRe
   writeLE32(pBlobSpot->pBuffer + edgeMetaOffset + sizeof(u32), *((u32*)&distance));
   writeLE64(pBlobSpot->pBuffer + edgeMetaOffset + sizeof(u64), nRowid);
 
-  writeLE16(pBlobSpot->pBuffer + sizeof(u64), nEdges);
-
   /* The vector and its metadata sit tens of kilobytes apart, so these land in
   ** different pages; the two metadata writes are adjacent and merge. */
   blobSpotDirty(pBlobSpot, edgeVectorOffset, pIndex->nEdgeVectorSize);
   blobSpotDirty(pBlobSpot, edgeMetaOffset + sizeof(u32), sizeof(u32));
   blobSpotDirty(pBlobSpot, edgeMetaOffset + sizeof(u64), sizeof(u64));
-  blobSpotDirty(pBlobSpot, sizeof(u64), sizeof(u16));
+
+  if( isAppend ){
+    writeLE16(pBlobSpot->pBuffer + sizeof(u64), nEdges);
+    blobSpotDirty(pBlobSpot, sizeof(u64), sizeof(u16));
+  }
 }
 
 // delete edge at position iDelete by swapping it with the last edge
