@@ -254,6 +254,10 @@
 
 int libsql_pager_codec(libsql_pghdr *p, void **ret);
 
+/* Per-page write census; no-ops unless LIBSQL_PGSTAT is set.  See pager.c. */
+void libsql_pgstat_frame(u32 pgno, u32 nByte);
+void libsql_pgstat_ckpt(u32 pgno, u32 szPage);
+
 typedef libsql_pghdr PgHdr;
 typedef sqlite3_wal Wal;
 
@@ -2130,6 +2134,7 @@ static int walCheckpoint(
         testcase( IS_BIG_INT(iOffset) );
         rc = sqlite3OsWrite(pWal->pDbFd, zBuf, szPage, iOffset);
         if( rc!=SQLITE_OK ) break;
+        libsql_pgstat_ckpt(iDbpage, (u32)szPage);
         if (xCb) {
             rc = (xCb)(pCbData, mxSafeFrame, zBuf, szPage, iDbpage, iFrame);
         }
@@ -3925,6 +3930,9 @@ static int walFrames(
         if( rc ) return rc;
         rc = sqlite3OsWrite(pWal->pWalFd, pData, szPage, iOff);
         if( rc ) return rc;
+        /* Overwriting a frame this transaction already appended still costs a
+        ** device write, so it counts the same as an append. */
+        libsql_pgstat_frame(p->pgno, (u32)szPage);
         p->flags &= ~PGHDR_WAL_APPEND;
         continue;
       }
@@ -3935,6 +3943,7 @@ static int walFrames(
     nDbSize = (isCommit && p->pDirty==0) ? nTruncate : 0;
     rc = walWriteOneFrame(&w, p, nDbSize, iOffset);
     if( rc ) return rc;
+    libsql_pgstat_frame(p->pgno, (u32)szFrame);
     pLast = p;
     iOffset += szFrame;
     p->flags |= PGHDR_WAL_APPEND;

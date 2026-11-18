@@ -494,12 +494,257 @@ abort:
   return rc;
 }
 
+/*
+** Edge-level update census (LIBSQL_DISKANN_EDGESTAT=1).
+**
+** blobSpotFlush() already knows which byte ranges of a node block changed.
+** Mapping those back onto the block layout answers three things the page
+** census cannot see:
+**
+**   1. how many edge slots one flush actually touches,
+**   2. how many pages those slots are spread over, against how many they
+**      would need if each edge's vector and metadata sat together - the
+**      layout change costs a format version, so its value is worth knowing
+**      before paying for it,
+**   3. how often each node is rewritten, which bounds what coalescing in a
+**      persistent tier could absorb.
+**
+** Page indices assume the block lives in an overflow chain, where page k
+** holds bytes [k*(szPage-4), (k+1)*(szPage-4)).  szPage defaults to 4096;
+** override with LIBSQL_DISKANN_EDGESTAT_PGSZ if the db uses another.
+*/
+int nodeMetadataSize(int nFormatVersion);
+int edgeMetadataSize(int nFormatVersion);
+
+#define DISKANN_ES_MAXHIST 16     /* slots-per-flush histogram cap */
+#define DISKANN_ES_MAXPG   256    /* distinct pages tracked within one flush */
+
+static struct DiskAnnEdgeStat {
+  u64 nFlush;                     /* flushes that wrote something */
+  u64 nSlotTotal;                 /* edge slots touched, summed over flushes */
+  u64 aSlotHist[DISKANN_ES_MAXHIST+2];  /* [n] = flushes touching n slots */
+  u64 nPageReal;                  /* distinct pages dirtied, summed */
+  u64 nPageIdeal;                 /* same under a slot-contiguous layout */
+  u64 nHdrTouch;                  /* flushes touching header or node vector */
+  u64 nWholeBlock;                /* flushes that reported the whole block */
+  u32 szPage;
+  int state;                      /* 0 unread, 1 on, 2 off */
+  u8 *aSeen;                      /* per-slot touched flags, this flush */
+  int nSeenAlloc;
+  u32 *aNode;                     /* flushes per node rowid */
+  u64 nNodeAlloc;
+  u64 mxRowid;
+  u64 nNodeSkip;                  /* rowids outside the tracked range */
+} diskAnnEdgeStat;
+
+static void diskAnnEdgeReport(void);
+
+static int diskAnnEdgeEnabled(void){
+  struct DiskAnnEdgeStat *p = &diskAnnEdgeStat;
+  if( p->state==0 ){
+    const char *z = getenv("LIBSQL_DISKANN_EDGESTAT");
+    if( z==0 || z[0]=='0' ){
+      p->state = 2;
+    }else{
+      const char *zPg = getenv("LIBSQL_DISKANN_EDGESTAT_PGSZ");
+      p->szPage = zPg ? (u32)atoi(zPg) : 4096;
+      if( p->szPage<512 ) p->szPage = 4096;
+      p->state = 1;
+      atexit(diskAnnEdgeReport);
+    }
+  }
+  return p->state==1;
+}
+
+/* Add pg to a small distinct-page set, ignoring repeats. */
+static int diskAnnEsPgAdd(u32 *aPg, int nPg, u32 pg){
+  int i;
+  for(i=0; i<nPg; i++){
+    if( aPg[i]==pg ) return nPg;
+  }
+  if( nPg<DISKANN_ES_MAXPG ) aPg[nPg++] = pg;
+  return nPg;
+}
+
+/* Count the pages [iOff, iOff+nByte) falls in, into the set aPg. */
+static int diskAnnEsPgRange(u32 *aPg, int nPg, u32 nUnit, int iOff, int nByte){
+  u32 pg, pgLast;
+  if( nByte<=0 ) return nPg;
+  pg = (u32)iOff / nUnit;
+  pgLast = (u32)(iOff + nByte - 1) / nUnit;
+  for(; pg<=pgLast; pg++){
+    nPg = diskAnnEsPgAdd(aPg, nPg, pg);
+  }
+  return nPg;
+}
+
+static void diskAnnEdgeNodeBump(u64 nRowid){
+  struct DiskAnnEdgeStat *p = &diskAnnEdgeStat;
+  if( nRowid==0 || nRowid>100000000 ){
+    p->nNodeSkip++;
+    return;
+  }
+  if( nRowid>=p->nNodeAlloc ){
+    u64 nNew = p->nNodeAlloc ? p->nNodeAlloc : 65536;
+    u32 *aNew;
+    while( nNew<=nRowid ) nNew *= 2;
+    /* Raw realloc: this outlives the library's allocator and must not show
+    ** up in the memory accounting being measured. */
+    aNew = realloc(p->aNode, (size_t)nNew*sizeof(u32));
+    if( aNew==0 ){ p->nNodeSkip++; return; }
+    memset(aNew+p->nNodeAlloc, 0, (size_t)(nNew-p->nNodeAlloc)*sizeof(u32));
+    p->aNode = aNew;
+    p->nNodeAlloc = nNew;
+  }
+  if( nRowid>p->mxRowid ) p->mxRowid = nRowid;
+  p->aNode[nRowid]++;
+}
+
+/*
+** Fold one flush's dirty ranges into the census.  Must run before
+** blobSpotFlush() clears them.
+*/
+static void diskAnnEdgeCount(const DiskAnnIndex *pIndex, BlobSpot *pBlobSpot){
+  struct DiskAnnEdgeStat *p = &diskAnnEdgeStat;
+  u32 aPgReal[DISKANN_ES_MAXPG], aPgIdeal[DISKANN_ES_MAXPG];
+  int nPgReal = 0, nPgIdeal = 0;
+  int nMaxEdge = nodeEdgesMaxCount(pIndex);
+  int nHdr = nodeMetadataSize(pIndex->nFormatVersion) + pIndex->nNodeVectorSize;
+  int iMetaBase = nodeEdgesMetadataOffset(pIndex);
+  int nEdgeMeta = edgeMetadataSize(pIndex->nFormatVersion);
+  int nSlotIdeal = pIndex->nEdgeVectorSize + nEdgeMeta;
+  u32 nUnit = p->szPage - 4;
+  int i, nSlot = 0, isHdr = 0;
+
+  p->nFlush++;
+  diskAnnEdgeNodeBump(pBlobSpot->nRowid);
+
+  if( pBlobSpot->nRange==0 ){
+    /* Narrowing off, or the range table overflowed: the whole block goes. */
+    p->nWholeBlock++;
+    p->nHdrTouch++;
+    p->nPageReal += (pBlobSpot->nBufferSize + nUnit - 1)/nUnit;
+    p->nPageIdeal += (pBlobSpot->nBufferSize + nUnit - 1)/nUnit;
+    p->aSlotHist[DISKANN_ES_MAXHIST+1]++;
+    return;
+  }
+
+  if( nMaxEdge>p->nSeenAlloc ){
+    u8 *aNew = realloc(p->aSeen, (size_t)nMaxEdge);
+    if( aNew==0 ) return;
+    p->aSeen = aNew;
+    p->nSeenAlloc = nMaxEdge;
+  }
+  memset(p->aSeen, 0, (size_t)nMaxEdge);
+
+  for(i=0; i<pBlobSpot->nRange; i++){
+    int iOff = (int)pBlobSpot->aRange[2*i];
+    int nByte = (int)pBlobSpot->aRange[2*i+1];
+    int iEnd = iOff + nByte;
+    int j;
+
+    nPgReal = diskAnnEsPgRange(aPgReal, nPgReal, nUnit, iOff, nByte);
+
+    /* Header and the node's own vector. */
+    if( iOff<nHdr ){
+      isHdr = 1;
+      nPgIdeal = diskAnnEsPgRange(aPgIdeal, nPgIdeal, nUnit, iOff,
+                                  MIN(iEnd, nHdr) - iOff);
+    }
+    /* Edge vectors: [nHdr, iMetaBase). */
+    for(j=MAX(iOff, nHdr); j<MIN(iEnd, iMetaBase); ){
+      int iSlot = (j - nHdr) / pIndex->nEdgeVectorSize;
+      if( iSlot>=0 && iSlot<nMaxEdge ) p->aSeen[iSlot] = 1;
+      j = nHdr + (iSlot+1)*pIndex->nEdgeVectorSize;
+    }
+    /* Edge metadata: [iMetaBase, ...). */
+    for(j=MAX(iOff, iMetaBase); j<iEnd; ){
+      int iSlot = (j - iMetaBase) / nEdgeMeta;
+      if( iSlot>=0 && iSlot<nMaxEdge ) p->aSeen[iSlot] = 1;
+      j = iMetaBase + (iSlot+1)*nEdgeMeta;
+    }
+  }
+
+  /* Under a slot-contiguous layout each touched slot is one run of
+  ** nSlotIdeal bytes starting right after the header. */
+  for(i=0; i<nMaxEdge; i++){
+    if( p->aSeen[i]==0 ) continue;
+    nSlot++;
+    nPgIdeal = diskAnnEsPgRange(aPgIdeal, nPgIdeal, nUnit,
+                                nHdr + i*nSlotIdeal, nSlotIdeal);
+  }
+
+  p->nSlotTotal += nSlot;
+  p->aSlotHist[nSlot<=DISKANN_ES_MAXHIST ? nSlot : DISKANN_ES_MAXHIST]++;
+  p->nPageReal += nPgReal;
+  p->nPageIdeal += nPgIdeal;
+  if( isHdr ) p->nHdrTouch++;
+}
+
+static void diskAnnEdgeReport(void){
+  struct DiskAnnEdgeStat *p = &diskAnnEdgeStat;
+  const char *zOut;
+  u64 i, nNode = 0, nNodeFlush = 0;
+  if( p->nFlush==0 ) return;
+
+  fprintf(stderr,
+    "diskann-edge: flushes=%llu  whole-block=%llu\n"
+    "              edge slots/flush: mean %.2f\n"
+    "              pages/flush: real %.2f  slot-contiguous %.2f  (%.2fx)\n"
+    "              header or node vector touched: %llu (%.1f%%)\n",
+    (unsigned long long)p->nFlush, (unsigned long long)p->nWholeBlock,
+    (double)p->nSlotTotal/(double)p->nFlush,
+    (double)p->nPageReal/(double)p->nFlush,
+    (double)p->nPageIdeal/(double)p->nFlush,
+    p->nPageIdeal ? (double)p->nPageReal/(double)p->nPageIdeal : 0.0,
+    (unsigned long long)p->nHdrTouch, 100.0*p->nHdrTouch/(double)p->nFlush);
+
+  fprintf(stderr, "              slots/flush hist:");
+  for(i=0; i<=DISKANN_ES_MAXHIST; i++){
+    if( p->aSlotHist[i]==0 ) continue;
+    /* The top bucket is saturating, so mark it as "or more". */
+    fprintf(stderr, " %llu%s:%llu", (unsigned long long)i,
+            i==DISKANN_ES_MAXHIST ? "+" : "",
+            (unsigned long long)p->aSlotHist[i]);
+  }
+  if( p->aSlotHist[DISKANN_ES_MAXHIST+1] ){
+    fprintf(stderr, " whole:%llu",
+            (unsigned long long)p->aSlotHist[DISKANN_ES_MAXHIST+1]);
+  }
+  fprintf(stderr, "\n");
+
+  for(i=1; i<=p->mxRowid; i++){
+    if( p->aNode && p->aNode[i] ){ nNode++; nNodeFlush += p->aNode[i]; }
+  }
+  fprintf(stderr,
+    "              nodes written: %llu  mean flushes/node %.2f  skipped %llu\n",
+    (unsigned long long)nNode,
+    nNode ? (double)nNodeFlush/(double)nNode : 0.0,
+    (unsigned long long)p->nNodeSkip);
+
+  zOut = getenv("LIBSQL_DISKANN_EDGESTAT_OUT");
+  if( zOut && p->aNode ){
+    FILE *out = fopen(zOut, "w");
+    if( out ){
+      fprintf(out, "rowid,n_flush\n");
+      for(i=1; i<=p->mxRowid; i++){
+        if( p->aNode[i] ){
+          fprintf(out, "%llu,%u\n", (unsigned long long)i, p->aNode[i]);
+        }
+      }
+      fclose(out);
+    }
+  }
+  fflush(stderr);
+}
+
 int blobSpotFlush(DiskAnnIndex* pIndex, BlobSpot *pBlobSpot) {
   int rc;
   if( !diskAnnNarrowStat.isInit ){
     diskAnnNarrowStat.isInit = 1;
     atexit(diskAnnNarrowReport);
   }
+  if( diskAnnEdgeEnabled() ) diskAnnEdgeCount(pIndex, pBlobSpot);
   diskAnnNarrowStat.nFlush++;
   diskAnnNarrowStat.nWholeByte += (u64)pBlobSpot->nBufferSize;
   if( blobSpotNarrow() ){

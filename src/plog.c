@@ -290,6 +290,10 @@
 
 int libsql_pager_codec(libsql_pghdr *p, void **ret);
 
+/* Per-page write census; no-ops unless LIBSQL_PGSTAT is set.  See pager.c. */
+void libsql_pgstat_frame(u32 pgno, u32 nByte);
+void libsql_pgstat_ckpt(u32 pgno, u32 szPage);
+
 typedef libsql_pghdr PgHdr;
 typedef sqlite3_wal Wal;
 
@@ -2409,6 +2413,7 @@ static int plogCheckpoint(
         testcase( IS_BIG_INT(iOffset) );
         rc = sqlite3OsWrite(pWal->pDbFd, zBuf, szPage, iOffset);
         if( rc!=SQLITE_OK ) break;
+        libsql_pgstat_ckpt(iDbpage, (u32)szPage);
         if (xCb) {
             rc = (xCb)(pCbData, mxSafeFrame, zBuf, szPage, iDbpage, iFrame);
         }
@@ -4368,6 +4373,7 @@ static int plogFrames(
     if( rc ) return rc;
     plogWriteStat.nFrame++;
     plogWriteStat.nByte += nFrame;
+    libsql_pgstat_frame(p->pgno, nFrame);
     iOffset += nFrame;
     rc = plogFrameRecord(pWal, iFrame+1, iOffset);
     if( rc ) return rc;

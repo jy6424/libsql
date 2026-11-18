@@ -3275,6 +3275,215 @@ static void pagerPlogReport(void){
   fflush(stderr);
 }
 
+/*
+** Per-page write census (LIBSQL_PGSTAT=1).
+**
+** Every time a page reaches the device it is counted against its page
+** number: once per WAL frame append, and once per checkpoint copy into the
+** db file.  The question this answers is how skewed that distribution is --
+** if a small persistent tier (MRAM, say) held the hottest N pages, writes
+** to those pages would never reach flash at all, so the coverage of the
+** top N pages is exactly the fraction of device writes such a tier removes.
+**
+** Output goes to LIBSQL_PGSTAT_OUT (default stderr): one CSV row per page
+** that saw any traffic, then a coverage table keyed by tier size.
+*/
+typedef struct PgStatEnt PgStatEnt;
+struct PgStatEnt {
+  u32 nFrame;                   /* WAL frame appends naming this page */
+  u32 nCkpt;                    /* checkpoint copies into the db file */
+  u64 nFrameByte;               /* bytes appended (plog frames vary in size) */
+};
+
+static struct PgStatCensus {
+  PgStatEnt *a;                 /* Indexed by page number */
+  u32 nAlloc;
+  u32 mxPgno;
+  u32 szPage;
+  int state;                    /* 0 unknown, 1 enabled, 2 disabled */
+} pgStatCensus;
+
+static void pgStatReport(void);
+
+static int pgStatEnabled(void){
+  if( pgStatCensus.state==0 ){
+    const char *z = getenv("LIBSQL_PGSTAT");
+    if( z==0 || z[0]==0 || (z[0]=='0' && z[1]==0) ){
+      pgStatCensus.state = 2;
+    }else{
+      pgStatCensus.state = 1;
+      atexit(pgStatReport);
+    }
+  }
+  return pgStatCensus.state==1;
+}
+
+static PgStatEnt *pgStatEntry(u32 pgno){
+  struct PgStatCensus *p = &pgStatCensus;
+  if( pgno==0 ) return 0;
+  if( pgno>=p->nAlloc ){
+    u32 nNew = p->nAlloc ? p->nAlloc : 65536;
+    PgStatEnt *aNew;
+    while( nNew<=pgno ) nNew *= 2;
+    /* Raw malloc on purpose: this runs from an atexit handler, which may be
+    ** after sqlite3_shutdown(), and it must not disturb the library's memory
+    ** accounting while that accounting is itself being measured. */
+    aNew = realloc(p->a, (size_t)nNew*sizeof(PgStatEnt));
+    if( aNew==0 ) return 0;
+    memset(aNew+p->nAlloc, 0, (size_t)(nNew-p->nAlloc)*sizeof(PgStatEnt));
+    p->a = aNew;
+    p->nAlloc = nNew;
+  }
+  if( pgno>p->mxPgno ) p->mxPgno = pgno;
+  return &p->a[pgno];
+}
+
+void libsql_pgstat_frame(u32 pgno, u32 nByte){
+  PgStatEnt *pEnt;
+  if( !pgStatEnabled() ) return;
+  pEnt = pgStatEntry(pgno);
+  if( pEnt ){
+    pEnt->nFrame++;
+    pEnt->nFrameByte += nByte;
+  }
+}
+
+void libsql_pgstat_ckpt(u32 pgno, u32 szPage){
+  PgStatEnt *pEnt;
+  if( !pgStatEnabled() ) return;
+  if( pgStatCensus.szPage==0 ) pgStatCensus.szPage = szPage;
+  pEnt = pgStatEntry(pgno);
+  if( pEnt ) pEnt->nCkpt++;
+}
+
+typedef struct PgStatRank PgStatRank;
+struct PgStatRank {
+  u32 pgno;
+  u32 nWrite;                   /* nFrame + nCkpt */
+  u64 nByte;                    /* frame bytes + checkpoint bytes */
+};
+
+static int pgStatCmpWrite(const void *pA, const void *pB){
+  const PgStatRank *a = (const PgStatRank*)pA;
+  const PgStatRank *b = (const PgStatRank*)pB;
+  if( a->nWrite!=b->nWrite ) return a->nWrite < b->nWrite ? 1 : -1;
+  return a->pgno < b->pgno ? -1 : a->pgno > b->pgno;
+}
+
+static int pgStatCmpByte(const void *pA, const void *pB){
+  const PgStatRank *a = (const PgStatRank*)pA;
+  const PgStatRank *b = (const PgStatRank*)pB;
+  if( a->nByte!=b->nByte ) return a->nByte < b->nByte ? 1 : -1;
+  return a->pgno < b->pgno ? -1 : a->pgno > b->pgno;
+}
+
+/*
+** Print one coverage table: for each tier size, how much of the total the
+** hottest pages that fit in that tier account for.
+*/
+static void pgStatCoverage(
+  FILE *out,
+  PgStatRank *aRank,
+  u32 nRank,
+  u32 szPage,
+  u64 nTotal,
+  int byBytes
+){
+  static const u32 aTierMB[] = { 1, 2, 4, 8, 16, 32, 64 };
+  u32 i;
+  if( nTotal==0 ) return;
+  qsort(aRank, nRank, sizeof(PgStatRank),
+        byBytes ? pgStatCmpByte : pgStatCmpWrite);
+  fprintf(out, "# tier_MB,pages,covered_%s,covered_pct\n",
+          byBytes ? "bytes" : "writes");
+  for(i=0; i<sizeof(aTierMB)/sizeof(aTierMB[0]); i++){
+    u64 nPagesFit = (u64)aTierMB[i]*1048576/szPage;
+    u32 j, nTake = (u32)(nPagesFit<nRank ? nPagesFit : nRank);
+    u64 nRun = 0;
+    for(j=0; j<nTake; j++){
+      nRun += byBytes ? aRank[j].nByte : (u64)aRank[j].nWrite;
+    }
+    fprintf(out, "# %u,%u,%llu,%.2f\n", aTierMB[i], nTake,
+            (unsigned long long)nRun, 100.0*(double)nRun/(double)nTotal);
+  }
+}
+
+static void pgStatReport(void){
+  struct PgStatCensus *p = &pgStatCensus;
+  const char *zOut;
+  FILE *out;
+  PgStatRank *aRank;
+  u32 i, nRank = 0, szPage;
+  u64 nTotal = 0, nFrameAll = 0, nCkptAll = 0;
+  u64 nByteAll = 0, nFrameByteAll = 0;
+
+  if( p->a==0 || p->mxPgno==0 ) return;
+  szPage = p->szPage ? p->szPage : 4096;
+
+  zOut = getenv("LIBSQL_PGSTAT_OUT");
+  out = zOut ? fopen(zOut, "w") : stderr;
+  if( out==0 ) out = stderr;
+
+  aRank = malloc((size_t)(p->mxPgno+1)*sizeof(PgStatRank));
+  fprintf(out, "pgno,n_frame,n_ckpt,frame_bytes,total_bytes\n");
+  for(i=1; i<=p->mxPgno; i++){
+    PgStatEnt *pEnt = &p->a[i];
+    u32 nWrite = pEnt->nFrame + pEnt->nCkpt;
+    u64 nByte;
+    if( nWrite==0 ) continue;
+    nByte = pEnt->nFrameByte + (u64)pEnt->nCkpt*szPage;
+    fprintf(out, "%u,%u,%u,%llu,%llu\n", i, pEnt->nFrame, pEnt->nCkpt,
+            (unsigned long long)pEnt->nFrameByte, (unsigned long long)nByte);
+    nFrameAll += pEnt->nFrame;
+    nCkptAll += pEnt->nCkpt;
+    nFrameByteAll += pEnt->nFrameByte;
+    nTotal += nWrite;
+    nByteAll += nByte;
+    if( aRank ){
+      aRank[nRank].pgno = i;
+      aRank[nRank].nWrite = nWrite;
+      aRank[nRank].nByte = nByte;
+      nRank++;
+    }
+  }
+
+  fprintf(out,
+    "#\n"
+    "# ---- per-page write census ----\n"
+    "# page size         : %u B\n"
+    "# pages touched     : %u  (max pgno %u)\n"
+    "# frame writes      : %llu  (%.2f MB)\n"
+    "# checkpoint writes : %llu  (%.2f MB)\n"
+    "# total page writes : %llu  (%.2f MB)  mean %.2f writes/page\n",
+    szPage, nRank, p->mxPgno,
+    (unsigned long long)nFrameAll, (double)nFrameByteAll/1048576.0,
+    (unsigned long long)nCkptAll,
+    (double)((u64)nCkptAll*szPage)/1048576.0,
+    (unsigned long long)nTotal, (double)nByteAll/1048576.0,
+    nRank ? (double)nTotal/(double)nRank : 0.0);
+
+  if( aRank && nTotal ){
+    fprintf(out,
+      "#\n"
+      "# tier coverage: the share of device writes that would never reach\n"
+      "# flash if the hottest pages that fit in a persistent tier of the\n"
+      "# given size were held there.  Bytes is the figure to compare against\n"
+      "# /sys/block; writes is the same ranking weighted by count.\n"
+      "#\n"
+      "# -- by bytes --\n");
+    pgStatCoverage(out, aRank, nRank, szPage, nByteAll, 1);
+    fprintf(out, "# hottest page by bytes: pgno=%u with %llu B\n",
+            aRank[0].pgno, (unsigned long long)aRank[0].nByte);
+    fprintf(out, "#\n# -- by write count --\n");
+    pgStatCoverage(out, aRank, nRank, szPage, nTotal, 0);
+    fprintf(out, "# hottest page by count: pgno=%u with %u writes\n",
+            aRank[0].pgno, aRank[0].nWrite);
+  }
+  fflush(out);
+  if( out!=stderr ) fclose(out);
+  free(aRank);
+}
+
 static int pagerPlogEnabled(void){
   if( pagerPlogState==0 ){
     const char *z = getenv("LIBSQL_PLOG");
