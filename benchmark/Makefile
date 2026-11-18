@@ -7,6 +7,8 @@ benchtest: benchtest.c
 	@cc benchtest.c -o benchtest -L ../.libs/ -llibsql -O2
 blobtest: blobtest.c
 	@cc blobtest.c -o blobtest -L ../.libs/ -llibsql -O2
+duptest: duptest.c
+	@cc duptest.c -o duptest -L ../.libs/ -llibsql -O2
 
 diskann.sql:
 	@python3 workload.py diskann 64 1000 1000 > diskann.sql
@@ -29,6 +31,7 @@ clean:
 	-rm benchtest
 	-rm blobtest
 	-rm anntest
+	-rm duptest
 	-rm *.sql
 	-rm *.db
 	-rm *.db-*
